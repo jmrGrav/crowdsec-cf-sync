@@ -2,6 +2,54 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.2.0] - 2026-05-22
+
+### Added
+
+- **OpenResty Lua mitigation layer** — custom high-performance bouncer in `lua/crowdsec/`; zero external deps, zero per-request I/O, sub-millisecond verdict lookup via `ngx.shared.dict`
+- **Python → Lua IPC** — `push_lua_state()` writes `/run/crowdsec-lua/bans.json` atomically after each sync cycle; Lua reloads via `ngx.timer.every(5)` background timer
+- **Lua → Python IPC** — OpenResty appends escalation events to `/run/crowdsec-lua/events.jsonl`; Python reads via atomic rename (race-free vs. Lua append) at start of each cycle
+- **Adaptive mitigation levels** (L0–L5): allow → rate-limit → tarpit → JS challenge → CAPTCHA → hard deny (403/444 based on score)
+- **Local heuristics scoring** — UA analysis, header coherence, path sensitivity, burst detection; scores accumulate per IP in shared dict with TTL; escalation events emitted to Python when threshold crossed
+- **Honeypot routes** — `/.env`, `/.git/config`, `/wp-admin/install.php`, `/phpmyadmin/index.php`, and others; instant +100 score + escalation event on any hit
+- **Bounded tarpit** — `ngx.sleep()` with `MAX_TARPITS = 20` concurrent ceiling; fail-open when limit exceeded to protect nginx workers from fd/memory exhaustion
+- **Verdict cache integrity** — entry count checksum in `bans.json`; Lua rejects partial/truncated files; sequence number prevents stale-file replay
+- **Source tagging** — verdict format extended to `"level:score:src"` (`p` = Python-pushed, `h` = heuristic-only); enables per-source metrics and debug
+- **Dict health monitoring** — `flush_expired()` called each sync tick; `cache:free_space()` reported in metrics; Prometheus endpoint at `/crowdsec-metrics`
+- **JSON debug endpoint** — `/crowdsec-status` (127.0.0.1 only) returns full Lua layer state, counters, tarpit status, sync metadata
+- **systemd ReadWritePaths** — `/run/crowdsec-lua/` added; `After=openresty.service` added
+
+### New files
+
+| Path | Purpose |
+|---|---|
+| `lua/crowdsec/init.lua` | Constants, shared dict handles, encode/decode helpers |
+| `lua/crowdsec/lookup.lua` | O(1) verdict lookup: exact IP → /24 CIDR → /16 CIDR |
+| `lua/crowdsec/heuristics.lua` | Per-request local scoring (UA, headers, path, burst) |
+| `lua/crowdsec/mitigation.lua` | Apply verdict: rate-limit / tarpit / challenge / deny |
+| `lua/crowdsec/tarpit.lua` | Bounded coroutine sleep with concurrency semaphore |
+| `lua/crowdsec/sync.lua` | Background ngx.timer.every() file loader |
+| `lua/crowdsec/events.lua` | Deferred escalation event writer (ngx.timer.at(0)) |
+| `lua/crowdsec/access.lua` | Per-request entry point (access_by_lua_block) |
+| `lua/crowdsec/metrics.lua` | JSON + Prometheus debug endpoints |
+| `nginx/crowdsec_shared_dicts.conf` | `lua_shared_dict` declarations (http block) |
+| `nginx/crowdsec_init.conf` | `lua_package_path`, `init_by_lua_block`, `init_worker_by_lua_block` |
+| `nginx/crowdsec_access.conf` | Per-vhost include (`access_by_lua_block`) |
+| `nginx/crowdsec_status.conf` | `/crowdsec-status` and `/crowdsec-metrics` locations |
+| `systemd/crowdsec-cf-sync.service` | Updated unit with `/run/crowdsec-lua/` in ReadWritePaths |
+| `scripts/setup-lua.sh` | One-time setup: sync dir, Lua modules, nginx snippets, systemd |
+| `scripts/test-lua-unit.sh` | resty CLI unit tests (no nginx required) |
+| `scripts/test-lua-integration.sh` | Live integration tests (OpenResty must be running) |
+
+### Changed
+
+- `main()` — startup log now includes `lua=enabled/disabled`
+- Main loop — `read_lua_events()` + `process_lua_events()` called at cycle start; `push_lua_state()` called after all local state is up to date
+- `_Metrics` — added `lua_syncs`, `lua_sync_errors`, `lua_escalations` counters
+- `_lua_sync_version` — global monotonic counter for Lua sync file versioning
+- New env var: `LUA_ENABLED` (default `1`; set `0` to disable Lua push entirely)
+- New env var: `LUA_SYNC_DIR` (default `/run/crowdsec-lua`)
+
 ## [3.1.0] - 2026-05-22
 
 ### Fixed

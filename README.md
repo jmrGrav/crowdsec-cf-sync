@@ -6,7 +6,7 @@ One active script; previous versions archived:
 
 | File | Version | Status |
 |---|---|---|
-| `crowdsec-cf-syncV3.py` | **3.1.0** — recommended | Active, production-ready |
+| `crowdsec-cf-syncV3.py` | **3.2.0** — recommended | Active, production-ready |
 | `archived/crowdsec-cf-syncV2.py` | 2.0.0 | Archived, kept for reference |
 | `archived/crowdsec-cf-sync.py` | 1.0.0 | Archived, kept for reference |
 
@@ -33,6 +33,50 @@ One active script; previous versions archived:
 - **Drift detection** — periodic reconciliation (default 300s) removes orphaned CF rules and re-adds missing bans; alerts BetterStack on drift
 - **Recidivist cursor** — cursor-based dedup prevents re-counting ban events across restarts
 
+### V3.2.0 additions — OpenResty Lua orchestration layer
+
+```mermaid
+graph TD
+    A[Internet] --> B[Cloudflare\ncoarse filter · global ban]
+    B --> C[OpenResty\nLua adaptive mitigation]
+    C --> D[Coraza / WAF\nanomaly scoring]
+    D --> E[Application]
+
+    CS[CrowdSec] -->|decisions| PY[Python daemon\ncrowdsec-cf-sync]
+    PY -->|bans.json atomic| LUA[Lua shared dict\ncrowdsec_cache]
+    PY -->|CF API| B
+    LUA -->|per-request O1 lookup| C
+    C -->|events.jsonl async| PY
+    PY -->|AbuseIPDB report| AB[AbuseIPDB]
+    PY -->|BetterStack ingest| BS[BetterStack]
+```
+
+**Mitigation levels** (per-IP, score-driven):
+
+| Score | Level | Action |
+|---|---|---|
+| 0 | L0 | Allow |
+| 1–30 | L1 | Rate limit (30 req/60s) |
+| 31–60 | L2 | Tarpit (3–12s sleep, bounded to 20 concurrent) |
+| 61–80 | L3 | JS challenge hint (429 + header) |
+| 81–95 | L5 | 403 Forbidden |
+| 96–100 | L5 | 444 Silent drop |
+
+**Key properties:**
+- Zero per-request I/O — lookup is pure shared dict read
+- Fail-open: if bans.json absent → allow (Cloudflare still blocks known bans)
+- Atomic IPC: Python → Lua via fsync+rename; Lua → Python via rename (race-free)
+- Sequence guard: Lua rejects stale or replayed sync files (monotonic version)
+- Entry count integrity: Lua rejects truncated/partial sync files
+- Dict health: `flush_expired()` each sync tick; `free_space()` in metrics
+
+**Local heuristics (no CrowdSec round-trip):**
+- Bad/missing user-agent (+15–30)
+- Missing Accept-Language (+10), missing Accept (+5)
+- Sensitive path access: `.env` (+60), `.git` (+40), `wp-admin` (+20)
+- Honeypot paths: instant +100 + escalation event to Python
+- Request burst (>120 req/60s): +up to 25
+
 ### V3.1.0 additions
 
 - **State versioning + sha256** — all state files wrapped in `{version, sha256, state}` envelope; checksum verified on load; corruption → `.bak` + clean default
@@ -54,6 +98,83 @@ One active script; previous versions archived:
 - **Config validation at startup** — missing env vars → immediate exit with a clear error
 - **JSON state corruption recovery** — corrupt state file renamed to `.bak`, daemon continues cleanly
 - **AbuseIPDB `/check` for OpenResty bouncer blocks** — queries abuse score, country, ISP, total reports once per IP per 24 h, ships enriched event to BetterStack
+
+## OpenResty Integration (V3.2)
+
+### Quick start
+
+```bash
+# 1. Install Lua layer
+sudo bash scripts/setup-lua.sh
+
+# 2. Add to your nginx.conf http {} block (or conf.d/00-crowdsec.conf):
+#   include /etc/openresty/conf.d/crowdsec_shared_dicts.conf;
+#   include /etc/openresty/conf.d/crowdsec_init.conf;
+
+# 3. Add to each protected vhost server {} block:
+#   include /etc/openresty/conf.d/crowdsec_access.conf;
+
+# 4. Add to a location block for debug endpoints (127.0.0.1 only):
+#   include /etc/openresty/conf.d/crowdsec_status.conf;
+
+# 5. Test config and reload
+sudo openresty -t && sudo systemctl reload openresty
+
+# 6. Verify Lua layer running
+curl -s http://127.0.0.1/crowdsec-status | python3 -m json.tool
+```
+
+### Coraza / WAF score correlation
+
+When using the [Coraza](https://coraza.io/) WAF via `lua-resty-waf` or the nginx module, you can feed anomaly scores into the CrowdSec Lua layer to trigger mitigation escalation:
+
+```nginx
+# In your vhost, after Coraza runs and before the CrowdSec access check:
+set $coraza_score 0;
+
+# Coraza sets $coraza_anomaly_score via custom action:
+#   SecAction "phase:5,id:999,setvar:tx.anomaly_score_pl1=%{tx.anomaly_score}"
+# Map it to a request variable:
+#   SecRuleEngine DetectionOnly   ← for observation mode
+#   SecRule TX:ANOMALY_SCORE "@ge 5" "phase:1,id:1000,setvar:request.coraza_score=%{tx.anomaly_score},pass,nolog"
+# Then in nginx: set $coraza_score $http_x_coraza_score;  ← or read from ngx.var
+
+access_by_lua_block {
+    local access = require "crowdsec.access"
+    access.check()
+
+    -- Coraza score correlation (add this if Coraza anomaly_score is available)
+    local coraza_score = tonumber(ngx.var.coraza_anomaly_score) or 0
+    if coraza_score >= 5 then
+        local lookup = require "crowdsec.lookup"
+        local cs = require "crowdsec.init"
+        local ip = ngx.var.remote_addr
+        local verdict = lookup.add_heuristic_score(ip, coraza_score * 2, cs.HEURISTIC_TTL)
+        if verdict and verdict.level > cs.LEVEL_ALLOW then
+            require("crowdsec.mitigation").apply(verdict, ip)
+        end
+    end
+}
+```
+
+> **Why multiply by 2?** Coraza anomaly scores start from 5 (one minor rule match). The CrowdSec score scale tops at 100. A ×2 factor means a Coraza score of 50 (10 minor matches or 2 critical) maps to 100 → hard deny. Adjust to your ruleset's noise level.
+
+### File permissions
+
+| Path | Owner | Mode | Notes |
+|---|---|---|---|
+| `/run/crowdsec-lua/` | `root:www-data` | `775` | Shared IPC dir |
+| `/run/crowdsec-lua/bans.json` | `root` | `644` | Written by Python, read by OpenResty |
+| `/run/crowdsec-lua/events.jsonl` | `root:www-data` | `664` | Written by OpenResty, renamed by Python |
+
+The `scripts/setup-lua.sh` script handles all permissions automatically.
+
+### New environment variables (V3.2)
+
+| Variable | Default | Description |
+|---|---|---|
+| `LUA_ENABLED` | `1` | Set to `0` to disable Lua push (daemon syncs CF only) |
+| `LUA_SYNC_DIR` | `/run/crowdsec-lua` | IPC directory for bans.json and events.jsonl |
 
 ## Requirements
 

@@ -74,6 +74,13 @@ CF_MIN_CONFIDENCE = os.environ.get("CF_MIN_CONFIDENCE", "low")
 CB_THRESHOLD      = int(os.environ.get("CF_CB_THRESHOLD", "5"))
 CB_RESET_SECS     = float(os.environ.get("CF_CB_RESET_SECS", "120"))
 
+# ── Lua sync (V3.2) ───────────────────────────────────────────────────────────
+# LUA_ENABLED=0 disables Lua push entirely (daemon still syncs CF only).
+LUA_ENABLED    = os.environ.get("LUA_ENABLED", "1").lower() not in ("0", "false", "no")
+LUA_SYNC_DIR   = Path(os.environ.get("LUA_SYNC_DIR", "/run/crowdsec-lua"))
+LUA_SYNC_FILE  = LUA_SYNC_DIR / "bans.json"
+LUA_EVENTS_FILE = LUA_SYNC_DIR / "events.jsonl"
+
 ABUSEIPDB_URL       = "https://api.abuseipdb.com/api/v2/report"
 ABUSEIPDB_CHECK_URL = "https://api.abuseipdb.com/api/v2/check"
 INTERVAL            = 60
@@ -174,6 +181,7 @@ _reload    = threading.Event()
 _wal_seq: int  = 0           # monotonic WAL entry counter; initialized from WAL on startup
 _boot_healthy: bool = False  # True after first successful CF API probe
 _degraded_reason: str = ""   # non-empty when in degraded mode
+_lua_sync_version: int = 0   # monotonic version pushed to Lua sync file
 
 
 def _handle_signal(signum: int, frame) -> None:
@@ -227,6 +235,9 @@ class _Metrics:
             "wal_entries":            0,
             "reconcile_runs":         0,
             "collapsed_rules":        0,
+            "lua_syncs":              0,
+            "lua_sync_errors":        0,
+            "lua_escalations":        0,
         }
         self._gauges: Dict[str, str] = {
             "last_sync_ts": "",
@@ -2032,6 +2043,170 @@ def poll_cloudflare_waf(
     return waf_state, recidivists, reported
 
 
+# ── Lua state sync (V3.2) ──────────────────────────────────────────────────────
+
+def push_lua_state(
+    active_bans: Set[str],
+    cidr_state: dict,
+    modsec_state: dict,
+    recidivists: dict,
+) -> None:
+    """Push current ban state to /run/crowdsec-lua/bans.json for OpenResty pickup.
+
+    This is the Python→Lua IPC path. OpenResty polls the file every 5s via
+    ngx.timer.every() and loads verdicts into shared dict. Per-request lookup
+    is then pure shared dict read — zero network or file I/O.
+
+    Lua performs an entry_count integrity check; if Python crashes mid-write,
+    the partial file is rejected and Lua keeps the previous good state.
+    """
+    global _lua_sync_version
+    if not LUA_ENABLED:
+        return
+    try:
+        LUA_SYNC_DIR.mkdir(parents=True, exist_ok=True)
+
+        _lua_sync_version += 1
+
+        bans: Dict[str, dict] = {}
+
+        # Active CrowdSec bans: score reflects recidivism
+        for ip in active_bans:
+            rec = recidivists.get(ip, {})
+            count = rec.get("count", 0)
+            # Base score 70; +10 per recidivist occurrence above 1, capped at 100
+            score = min(100, 70 + max(0, count - 1) * 10)
+            bans[ip] = {"score": score, "level": 5, "ttl": 3600, "reason": "crowdsec-ban"}
+
+        # ModSec bans: 2h TTL, medium-high score
+        for ip in modsec_state:
+            if ip not in bans:
+                bans[ip] = {"score": 80, "level": 5, "ttl": MODSEC_BAN_SECS, "reason": "modsec-ban"}
+
+        # CIDR bans
+        cidrs: Dict[str, dict] = {}
+        for cidr in cidr_state:
+            cidrs[cidr] = {"score": 100, "level": 5, "ttl": 86400, "reason": "crowdsec-cidr"}
+
+        payload: dict = {
+            "version":     _lua_sync_version,
+            "updated_at":  datetime.now(timezone.utc).isoformat(),
+            "entry_count": len(bans) + len(cidrs),
+            "bans":        bans,
+            "cidrs":       cidrs,
+        }
+
+        # Raw JSON write (no versioning envelope — Lua reads it directly)
+        content = json.dumps(payload, indent=2, ensure_ascii=False).encode()
+        tmp_fd, tmp_path = tempfile.mkstemp(dir=LUA_SYNC_DIR, suffix=".tmp")
+        try:
+            with os.fdopen(tmp_fd, "wb") as f:
+                f.write(content)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, LUA_SYNC_FILE)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+
+        metrics.inc("lua_syncs")
+        log.debug(
+            "Lua sync: %d bans + %d CIDRs (v%d)",
+            len(bans), len(cidrs), _lua_sync_version,
+        )
+    except Exception as exc:
+        metrics.inc("lua_sync_errors")
+        log.warning("Lua push échoué (non-fatal): %s", exc)
+
+
+def read_lua_events() -> List[dict]:
+    """Consume escalation events written by OpenResty Lua layer.
+
+    Uses atomic rename (events.jsonl → events.jsonl.processing) to avoid
+    the read-and-truncate race where Lua appends while Python truncates.
+    Lua automatically creates a new events.jsonl after the rename.
+    """
+    if not LUA_ENABLED or not LUA_EVENTS_FILE.exists():
+        return []
+    proc_file = LUA_EVENTS_FILE.with_suffix(".processing")
+    try:
+        LUA_EVENTS_FILE.rename(proc_file)
+    except (FileNotFoundError, OSError):
+        return []
+    events_out: List[dict] = []
+    try:
+        with proc_file.open(encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    events_out.append(json.loads(line))
+                except json.JSONDecodeError:
+                    pass
+    finally:
+        try:
+            proc_file.unlink()
+        except OSError:
+            pass
+    if events_out:
+        log.info("Lua events: %d événement(s) reçu(s)", len(events_out))
+        metrics.inc("lua_escalations", len(events_out))
+    return events_out
+
+
+def process_lua_events(
+    events_in: List[dict],
+    reported: dict,
+    cs_allowlist: Set[str],
+) -> dict:
+    """Process escalation events from OpenResty Lua layer.
+
+    Current handling:
+      honeypot_hit        → report to AbuseIPDB if not already reported
+      heuristic_escalate  → log + optionally report to AbuseIPDB
+
+    Future: push to CrowdSec LAPI via `cscli decisions add`.
+    Python daemon remains the single orchestration authority.
+    """
+    if not events_in:
+        return reported
+
+    for ev in events_in:
+        ev_type = ev.get("type", "")
+        ip      = ev.get("ip", "")
+        score   = ev.get("score", 0)
+        detail  = ev.get("detail", "")
+
+        if not ip or is_allowlisted(ip, cs_allowlist) or is_protected(ip):
+            continue
+
+        try:
+            ipaddress.ip_address(ip)
+        except ValueError:
+            continue
+
+        if ev_type == "honeypot_hit":
+            log.warning("Honeypot hit from %s (path=%s) — score=%d", ip, detail, score)
+            if ip not in reported:
+                cats = "21,19"
+                comment = f"Honeypot path access: {detail}"
+                report_to_abuseipdb(ip, cats, comment, reported)
+
+        elif ev_type == "heuristic_escalate":
+            log.info("Lua heuristic escalation: %s score=%d detail=%s", ip, score, detail)
+            # Only report once per IP per session
+            if ip not in reported and score >= 90:
+                cats = "21,19"
+                comment = f"Lua heuristic score {score}: {detail}"
+                report_to_abuseipdb(ip, cats, comment, reported)
+
+    return reported
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main() -> None:
     global _boot_healthy, _degraded_reason, _wal_seq, _protected_networks
@@ -2046,11 +2221,12 @@ def main() -> None:
     log.info("Protected ranges: %d réseaux chargés", len(_protected_networks))
 
     log.info(
-        "=== CrowdSec CF Sync V4 démarré (interval=%ds | dry_run=%s | "
-        "confidence=%s | health_port=%s | state_version=%d) ===",
+        "=== CrowdSec CF Sync V3.2 démarré (interval=%ds | dry_run=%s | "
+        "confidence=%s | health_port=%s | state_version=%d | lua=%s) ===",
         INTERVAL, DRY_RUN, CF_MIN_CONFIDENCE,
         HEALTH_PORT if HEALTH_PORT else "disabled",
         STATE_VERSION,
+        "enabled" if LUA_ENABLED else "disabled",
     )
 
     _start_health_server()
@@ -2136,6 +2312,13 @@ def main() -> None:
                 continue
 
         try:
+            # ── Lua event ingestion (start of cycle) ──────────────────────────
+            # Atomic rename avoids read-truncate race with Lua append.
+            if LUA_ENABLED and not _shutdown.is_set():
+                lua_events = read_lua_events()
+                if lua_events:
+                    reported = process_lua_events(lua_events, reported, cs_allowlist)
+
             sync_cloudflare(cs_allowlist)
 
             if not _shutdown.is_set():
@@ -2152,6 +2335,15 @@ def main() -> None:
                 bouncer_check_state = sync_bouncer_abuseipdb(bouncer_check_state, cs_allowlist)
 
             recidivists = purge_old_recidivists(recidivists)
+
+            # ── Lua state push (after all local state is up to date) ──────────
+            # active_bans is re-derived here; sync_cloudflare already computed it
+            # but doesn't expose it. We call get_active_bans() which is cheap
+            # (cscli cache hit within the same cycle).
+            if LUA_ENABLED and not _shutdown.is_set():
+                _active = get_active_bans()
+                if _active is not None:
+                    push_lua_state(_active, cidr_state, modsec_state, recidivists)
 
             # WAF poll (every CF_WAF_POLL_SECS)
             waf_poll_count += 1

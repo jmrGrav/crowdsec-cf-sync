@@ -1,0 +1,35 @@
+[Unit]
+Description=CrowdSec → Cloudflare IP Sync + OpenResty Lua Orchestrator
+After=network.target crowdsec.service openresty.service
+Wants=crowdsec.service
+
+[Service]
+EnvironmentFile=/etc/crowdsec/cf-sync.env
+Type=notify
+ExecStart=/usr/bin/python3 /usr/local/bin/crowdsec-cf-syncV3.py
+Restart=always
+RestartSec=10
+WatchdogSec=120
+User=root
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=crowdsec-cf-sync
+
+# Hardening (V3.1 baseline + V3.2 additions)
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+ReadWritePaths=/var/log/crowdsec/ /run/crowdsec-lua/
+ReadOnlyPaths=/var/log/nginx/
+
+[Install]
+WantedBy=multi-user.target
