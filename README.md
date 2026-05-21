@@ -2,11 +2,12 @@
 
 A Python daemon that bridges [CrowdSec](https://www.crowdsec.net/) and [Cloudflare](https://www.cloudflare.com/) Firewall, with AbuseIPDB reporting, recidivist escalation, ModSecurity-based instant bans, and automatic /24 CIDR blocking.
 
-Two versions are available in this repository:
+Three versions are available in this repository:
 
 | File | Version | Status |
 |---|---|---|
-| `crowdsec-cf-syncV2.py` | **2.0.0** — recommended | Active, production-ready |
+| `crowdsec-cf-syncV3.py` | **3.0.0** — recommended | Active, production-ready |
+| `crowdsec-cf-syncV2.py` | 2.0.0 — previous | Stable, kept for reference |
 | `crowdsec-cf-sync.py` | 1.0.0 — legacy | Archived, kept for reference |
 
 ## Features
@@ -17,6 +18,20 @@ Two versions are available in this repository:
 - **ModSecurity instant ban** — ModSecurity anomaly score ≥ 5 → immediate 2h Cloudflare block + AbuseIPDB report
 - **Auto /24 CIDR block** — when 2+ distinct IPs from the same /24 are banned within 7 days, the entire subnet is blocked for 24h
 - **Cloudflare WAF polling** — detects mass-hits on WAF rules and escalates via CrowdSec
+
+### V3 additions
+
+- **Anti-self-ban** — immutable protected ranges (RFC1918, Cloudflare anycast, Tailscale CGNAT, own IPs) guard every `add_cf_rule()` call
+- **Circuit breakers** — graceful degradation when Cloudflare, CrowdSec, or AbuseIPDB APIs are down; auto-reset after configurable timeout
+- **DRY_RUN / shadow mode** — `CF_DRY_RUN=1` simulates without applying; safe for testing against production state
+- **Health + Prometheus metrics** — `http://127.0.0.1:CF_HEALTH_PORT/health` (JSON) and `/metrics` (Prometheus text); scrape-ready for Grafana
+- **WAL (Write-Ahead Log)** — append-only journal at `/var/log/crowdsec/cf-sync-wal.jsonl` for every Cloudflare operation
+- **SIGHUP hot reload** — reload allowlist and config without daemon restart
+- **sd_notify watchdog** — native systemd `WatchdogSec=` integration via `NOTIFY_SOCKET`
+- **Adaptive mitigation** — `CF_MIN_CONFIDENCE` gates scenarios by confidence level (low / medium / high)
+- **Rule collapsing** — `ipaddress.collapse_addresses()` coalesces adjacent IPs into minimal CIDR set before CF batch
+- **Drift detection** — periodic reconciliation (default 300s) removes orphaned CF rules and re-adds missing bans; alerts BetterStack on drift
+- **Recidivist cursor** — cursor-based dedup prevents re-counting ban events across restarts
 
 ### V2 additions
 
@@ -47,6 +62,12 @@ Two versions are available in this repository:
 | `CS_API_KEY` | No | CrowdSec LAPI key (optional) |
 | `BETTERSTACK_TOKEN` | No | BetterStack source token for log ingestion |
 | `BETTERSTACK_INGEST` | No | BetterStack ingest URL (e.g. `https://your-source.betterstackdata.com/`) |
+| `CF_DRY_RUN` | No | Set to `1` to enable shadow mode (no CF/AbuseIPDB writes) |
+| `CF_HEALTH_PORT` | No | HTTP port for `/health` and `/metrics` (default `8765`; `0` = disabled) |
+| `CF_RECONCILE_SECS` | No | Reconciliation interval in seconds (default `300`) |
+| `CF_MIN_CONFIDENCE` | No | Minimum scenario confidence to sync to CF: `low` (default), `medium`, `high` |
+| `CF_CB_THRESHOLD` | No | Circuit breaker failure threshold before opening (default `5`) |
+| `CF_CB_RESET_SECS` | No | Circuit breaker reset timeout in seconds (default `120`) |
 
 ## State Files
 
@@ -59,7 +80,8 @@ The daemon maintains JSON state files under `/var/log/crowdsec/`:
 | `modsec-banned.json` | ModSecurity temporary bans |
 | `cidr-banned.json` | Active /24 CIDR blocks |
 | `cf_waf_state.json` | Cloudflare WAF polling cursor |
-| `bouncer-abusecheck.json` | AbuseIPDB check cache for bouncer-blocked IPs *(V2 only)* |
+| `bouncer-abusecheck.json` | AbuseIPDB check cache for bouncer-blocked IPs *(V2+)* |
+| `cf-sync-wal.jsonl` | Write-Ahead Log of CF operation intents *(V3 only)* |
 | `cf-sync.log` | Daemon log |
 
 ## Systemd Service
@@ -70,15 +92,18 @@ Description=CrowdSec → Cloudflare IP Sync
 After=network.target crowdsec.service
 
 [Service]
-Type=simple
+Type=notify
 EnvironmentFile=/etc/crowdsec/cf-sync.env
-ExecStart=/usr/bin/python3 /usr/local/bin/crowdsec-cf-syncV2.py
+ExecStart=/usr/bin/python3 /usr/local/bin/crowdsec-cf-syncV3.py
 Restart=on-failure
 RestartSec=10
+WatchdogSec=120
 
 [Install]
 WantedBy=multi-user.target
 ```
+
+> **V3 note**: `Type=notify` and `WatchdogSec=120` enable sd_notify watchdog. V3 sends `READY=1` at startup and `WATCHDOG=1` every cycle; systemd will restart the daemon if it stops sending heartbeats.
 
 Create `/etc/crowdsec/cf-sync.env` with your secrets (never commit this file):
 

@@ -2,6 +2,28 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.0.0] - 2026-05-22
+
+### Added
+- **Anti-self-ban** — immutable protected ranges (RFC1918, Cloudflare anycast, Tailscale CGNAT 100.64.0.0/10, loopback, link-local) checked in `is_protected()` before every `add_cf_rule()` call; own IPs loaded from `ip -j addr` at startup
+- **Circuit breakers** — `CircuitBreaker` class for Cloudflare, CrowdSec, and AbuseIPDB APIs; opens after `CF_CB_THRESHOLD` (default 5) consecutive failures, resets after `CF_CB_RESET_SECS` (default 120s); prevents cascade failures when an API is down
+- **DRY_RUN / shadow mode** — `CF_DRY_RUN=1` simulates all Cloudflare operations without applying them; logged as `[DRY RUN]`; health endpoint reports `"mode": "dry_run"`
+- **Health + Prometheus metrics HTTP endpoint** — `http://127.0.0.1:CF_HEALTH_PORT/health` (JSON) and `/metrics` (Prometheus text format); disabled when `CF_HEALTH_PORT=0`; metrics: cycles, CF API calls/errors, rules added/removed, drift events, circuit breaker trips, AbuseIPDB reports, recidivists, CIDR blocks, protected blocks
+- **WAL (Write-Ahead Log)** — every Cloudflare operation intent appended to `/var/log/crowdsec/cf-sync-wal.jsonl` before API call; trimmed to 10,000 lines on startup; provides audit trail for post-mortem analysis
+- **SIGHUP hot reload** — `SIGHUP` signal triggers reload of CrowdSec allowlist and protected ranges without daemon restart; logged as `Hot reload terminé`
+- **sd_notify watchdog** — `_sd_notify()` sends `READY=1`, `WATCHDOG=1` (each cycle), and `STOPPING=1` via `NOTIFY_SOCKET` unix socket for native systemd watchdog integration (`WatchdogSec=`)
+- **Adaptive mitigation** — `CF_MIN_CONFIDENCE` (default `low`) gates which scenarios are synced to Cloudflare; `low` = all, `medium` = excludes low-confidence scanners, `high` = only confirmed threats; uses `_scenario_confidence()` heuristic on scenario name
+- **Rule collapsing** — `collapse_ips()` uses `ipaddress.collapse_addresses()` to coalesce adjacent IPs into minimal CIDR set before CF batch operations, reducing API call count
+- **Drift detection / reconciliation** — `reconcile_state()` compares active CF rules against current CrowdSec bans every `CF_RECONCILE_SECS` (default 300s); orphaned CF rules removed, missing bans re-added, drift events shipped to BetterStack and counted in metrics
+- **Recidivist cursor** — `_cursor` timestamp stored in `recidivists.json` prevents re-processing the same ban events across restarts; initialized to `now` on first V3 run to avoid retroactively re-counting bans that V2 already processed
+- `WAL_FILE` — new state file `/var/log/crowdsec/cf-sync-wal.jsonl`
+
+### Changed
+- `sync_recidivists()` — cursor-based dedup replaces full 48h re-scan each cycle; `purge_old_recidivists()` preserves `_cursor` key
+- `sync_cloudflare()` — now accepts `cs_allowlist` parameter; applies adaptive mitigation filter via `_should_sync_to_cf()` before adding CF rules
+- `add_cf_rule()` — `is_protected()` guard added; WAL entry written before API call; DRY_RUN path logs intent without calling CF API
+- New env vars: `CF_DRY_RUN`, `CF_HEALTH_PORT`, `CF_RECONCILE_SECS`, `CF_MIN_CONFIDENCE`, `CF_CB_THRESHOLD`, `CF_CB_RESET_SECS`
+
 ## [2.0.0] - 2026-05-21
 
 ### Added
