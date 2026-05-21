@@ -2,13 +2,13 @@
 
 A Python daemon that bridges [CrowdSec](https://www.crowdsec.net/) and [Cloudflare](https://www.cloudflare.com/) Firewall, with AbuseIPDB reporting, recidivist escalation, ModSecurity-based instant bans, and automatic /24 CIDR blocking.
 
-Three versions are available in this repository:
+One active script; previous versions archived:
 
 | File | Version | Status |
 |---|---|---|
-| `crowdsec-cf-syncV3.py` | **3.0.0** — recommended | Active, production-ready |
-| `crowdsec-cf-syncV2.py` | 2.0.0 — previous | Stable, kept for reference |
-| `crowdsec-cf-sync.py` | 1.0.0 — legacy | Archived, kept for reference |
+| `crowdsec-cf-syncV3.py` | **3.1.0** — recommended | Active, production-ready |
+| `archived/crowdsec-cf-syncV2.py` | 2.0.0 | Archived, kept for reference |
+| `archived/crowdsec-cf-sync.py` | 1.0.0 | Archived, kept for reference |
 
 ## Features
 
@@ -19,7 +19,7 @@ Three versions are available in this repository:
 - **Auto /24 CIDR block** — when 2+ distinct IPs from the same /24 are banned within 7 days, the entire subnet is blocked for 24h
 - **Cloudflare WAF polling** — detects mass-hits on WAF rules and escalates via CrowdSec
 
-### V3 additions
+### V3 additions (3.0.0)
 
 - **Anti-self-ban** — immutable protected ranges (RFC1918, Cloudflare anycast, Tailscale CGNAT, own IPs) guard every `add_cf_rule()` call
 - **Circuit breakers** — graceful degradation when Cloudflare, CrowdSec, or AbuseIPDB APIs are down; auto-reset after configurable timeout
@@ -33,7 +33,18 @@ Three versions are available in this repository:
 - **Drift detection** — periodic reconciliation (default 300s) removes orphaned CF rules and re-adds missing bans; alerts BetterStack on drift
 - **Recidivist cursor** — cursor-based dedup prevents re-counting ban events across restarts
 
-### V2 additions
+### V3.1.0 additions
+
+- **State versioning + sha256** — all state files wrapped in `{version, sha256, state}` envelope; checksum verified on load; corruption → `.bak` + clean default
+- **WAL crash-durability** — `fsync()` after every WAL append and atomic write ensures entries survive hard power-off
+- **CIDR-aware reconciliation** — drift check skips IPs already covered by an active `/24` CIDR block; eliminates false drift and duplicate CF rules
+- **Boot degraded mode** — CF unreachable at startup → no rule modifications; auto-recovers each cycle without crashing
+- **Single CF API call per reconciliation** — `_fetch_cf_rules()` called once per reconciliation cycle (was 3 calls in 3.0.0)
+- **Jitter in HTTP retry** — prevents thundering-herd on API recovery
+- **CF quota warning** — logs warning + increments metric when rule count reaches 800/1000
+- **systemd hardening** — `NoNewPrivileges`, `ProtectSystem=strict`, `MemoryDenyWriteExecute`, `SystemCallArchitectures=native`, and more
+
+### V2 additions (archived)
 
 - **Graceful shutdown** — SIGTERM/SIGINT handled via `threading.Event`; sleep is interruptible
 - **Atomic JSON writes** — all state files written via `tempfile.mkstemp()` + `os.replace()`
@@ -90,14 +101,35 @@ The daemon maintains JSON state files under `/var/log/crowdsec/`:
 [Unit]
 Description=CrowdSec → Cloudflare IP Sync
 After=network.target crowdsec.service
+Wants=crowdsec.service
 
 [Service]
-Type=notify
 EnvironmentFile=/etc/crowdsec/cf-sync.env
+Type=notify
 ExecStart=/usr/bin/python3 /usr/local/bin/crowdsec-cf-syncV3.py
-Restart=on-failure
+Restart=always
 RestartSec=10
 WatchdogSec=120
+User=root
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=crowdsec-cf-sync
+
+# Hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+ReadWritePaths=/var/log/crowdsec/
+ReadOnlyPaths=/var/log/nginx/
 
 [Install]
 WantedBy=multi-user.target

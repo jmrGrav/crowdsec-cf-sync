@@ -2,6 +2,33 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.1.0] - 2026-05-22
+
+### Fixed
+- **CIDR-aware reconciliation** — `reconcile_state()` now builds `cidr_nets` from active `/24` CIDR blocks and checks every IP against them via `_ip_in_cf()`; IPs already covered by a CIDR block are no longer flagged as drift, preventing duplicate CF rules accumulating silently
+- **WAL crash-durability** — `_wal_log()` now calls `f.flush()` + `os.fsync()` after every append; WAL entries survive hard power-off without loss
+- **Atomic write durability** — `_atomic_write_json()` calls `os.fsync()` on the temp file before `os.replace()`; state files survive crash-on-rename
+- **Single CF API call per reconciliation** — `reconcile_state()` calls `_fetch_cf_rules()` once and passes the result to `get_cf_blocked_ips()` / `get_cf_rules_by_tag()`; eliminates 2 redundant CF calls per reconciliation cycle
+- **Boot degraded mode** — if Cloudflare is unreachable at startup, the daemon enters degraded mode (no rule modifications) and auto-recovers on each subsequent cycle without crashing
+
+### Added
+- **State versioning with sha256 checksum** — all state files written in `{"version": 1, "updated_at": "...", "sha256": "...", "state": {...}}` envelope; sha256 verified on load; mismatch → corrupt file renamed to `.bak`, daemon continues with clean default; V3 flat format accepted and migrated transparently on next save
+- **WAL sequential IDs** — each WAL entry carries `"id"` (monotonically increasing across restarts) initialized from line count of existing WAL file; improves post-mortem tracing
+- **Jitter in HTTP retry** — `_http_call()` adds `random.uniform(0, base_wait * 0.3)` to each retry wait to prevent thundering-herd when Cloudflare, CrowdSec, or AbuseIPDB recovers after a brief outage
+- **CF quota warning** — `_fetch_cf_rules()` logs `WARNING` and increments `cf_quota_warnings` metric when rule count reaches 800/1000
+- **`ip -j addr` for own-IP detection** — `_build_protected_networks()` uses `ip -j addr` (reliable, machine-readable) instead of `hostname -I`; fallback to `socket.getaddrinfo(gethostname())` if `ip` is unavailable
+- **systemd hardening** — service unit adds `NoNewPrivileges`, `PrivateTmp`, `ProtectSystem=strict`, `ProtectHome`, `ProtectKernelTunables`, `ProtectKernelModules`, `ProtectControlGroups`, `RestrictSUIDSGID`, `MemoryDenyWriteExecute`, `LockPersonality`, `RestrictRealtime`, `SystemCallArchitectures=native`, `ReadWritePaths=/var/log/crowdsec/`, `ReadOnlyPaths=/var/log/nginx/`
+- **V1/V2 archived** — `crowdsec-cf-sync.py` (1.0.0) and `crowdsec-cf-syncV2.py` (2.0.0) moved to `archived/`; `crowdsec-cf-syncV3.py` is the single active script
+
+### Changed
+- `_load_json_state()` — reads versioned envelope; falls back to V3 flat dict transparently
+- `_atomic_write_json()` — wraps state in versioned envelope with sha256 before writing
+- `_wal_log()` — adds `id` field; calls fsync
+- `_fetch_cf_rules()` — extracted from inline calls; single shared function with quota warning
+- `_parse_cf_rules_by_tag()` — extracted helper; accepts pre-fetched rules list
+- `_build_protected_networks()` — uses `ip -j addr` with socket fallback
+- `_http_call()` — jitter added to retry wait
+
 ## [3.0.0] - 2026-05-22
 
 ### Added

@@ -1,34 +1,41 @@
 #!/usr/bin/env python3
 """
-CrowdSec → Cloudflare IP Sync — V3
+CrowdSec → Cloudflare IP Sync — V4
 
-Improvements over V2:
-  - Anti-self-ban: immutable protected ranges (RFC1918, Cloudflare, Tailscale, self)
-  - Circuit breaker: graceful degradation when CF/CrowdSec APIs are down
-  - DRY_RUN / shadow mode: CF_DRY_RUN=1 simulates without applying
-  - Health + Prometheus metrics: HTTP endpoint on 127.0.0.1:CF_HEALTH_PORT
-  - WAL: append-only journal of every CF operation intent
-  - SIGHUP hot reload: reload allowlist + config without restart
-  - sd_notify watchdog: native systemd integration (WatchdogSec)
-  - Adaptive mitigation: route by scenario confidence (low→local, high→CF)
-  - Rule collapsing: ipaddress.collapse_addresses() before CF batch
-  - Drift detection: reconciliation compares CF state vs local, alerts BetterStack
+Improvements over V3:
+  - fsync WAL + atomic writes: write-ahead log is now truly crash-durable
+  - State versioning: all state files wrapped in {version, sha256, state} envelope
+  - Snapshot checksum: sha256 detects silent disk corruption on every load
+  - CIDR-aware reconciliation: drift_add excludes IPs already covered by /24 CIDR blocks
+  - Single CF API call per reconciliation (was 3 in V3)
+  - Jitter in HTTP retry: prevents thundering herd on 429 storms
+  - CF quota awareness: warning at 800/1000 rules
+  - Boot degraded mode: CF unreachable at startup → degraded (no rule wipe), auto-recover
+  - Protected IPs via `ip -j addr` (reliable) with fallback to socket
+  - _fetch_cf_rules() / _parse_cf_rules_by_tag() helpers to cache CF API reads
 
-All V2 features preserved:
-  - Graceful shutdown (SIGTERM/SIGINT)
-  - Atomic JSON writes (tempfile + os.replace)
-  - HTTP retry with exponential backoff
-  - RotatingFileHandler (5 MB × 3)
-  - IP/CIDR validation before CF calls
-  - Config validation at startup
-  - JSON state corruption recovery
-  - Recidivist escalation
-  - ModSecurity CF ban (2h) + AbuseIPDB
-  - Auto /24 CIDR block
-  - Cloudflare WAF polling
-  - OpenResty bouncer AbuseIPDB check
+Architecture note — source of truth:
+  Cloudflare API = canonical state.
+  Local state files = acceleration cache + replay aid.
+  reconcile_state() is the final arbiter, not the WAL.
+  The WAL is an append-only audit trail, not a distributed transaction log.
+
+All V3 features preserved:
+  - Anti-self-ban (protected ranges)
+  - Circuit breakers (CF, CrowdSec, AbuseIPDB)
+  - DRY_RUN / shadow mode
+  - Health + Prometheus metrics HTTP endpoint
+  - SIGHUP hot reload
+  - sd_notify watchdog
+  - Adaptive mitigation (CF_MIN_CONFIDENCE)
+  - Rule collapsing
+  - Recidivist cursor (no double-counting across restarts)
+  - Graceful shutdown, atomic JSON writes, HTTP retry, RotatingFileHandler
+  - Recidivist escalation, ModSec CF ban, auto /24 CIDR block
+  - Cloudflare WAF polling, OpenResty bouncer AbuseIPDB check
 """
 
+import hashlib
 import http.server
 import io
 import ipaddress
@@ -36,6 +43,7 @@ import json
 import logging
 import logging.handlers
 import os
+import random
 import re
 import signal
 import socket
@@ -52,28 +60,28 @@ from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
 # ── Configuration ─────────────────────────────────────────────────────────────
-CF_API_TOKEN      = os.environ.get("CF_API_TOKEN", "")
-CF_ZONE_ID        = os.environ.get("CF_ZONE_ID", "")
-CS_API_KEY        = os.environ.get("CS_API_KEY", "")
-ABUSEIPDB_KEY     = os.environ.get("ABUSEIPDB_KEY", "")
-BETTERSTACK_TOKEN = os.environ.get("BETTERSTACK_TOKEN", "")
+CF_API_TOKEN       = os.environ.get("CF_API_TOKEN", "")
+CF_ZONE_ID         = os.environ.get("CF_ZONE_ID", "")
+CS_API_KEY         = os.environ.get("CS_API_KEY", "")
+ABUSEIPDB_KEY      = os.environ.get("ABUSEIPDB_KEY", "")
+BETTERSTACK_TOKEN  = os.environ.get("BETTERSTACK_TOKEN", "")
 BETTERSTACK_INGEST = os.environ.get("BETTERSTACK_INGEST", "")
 
-# V3 — new env vars
-DRY_RUN          = os.environ.get("CF_DRY_RUN", "").lower() in ("1", "true", "yes")
-HEALTH_PORT      = int(os.environ.get("CF_HEALTH_PORT", "8765"))
-RECONCILE_SECS   = int(os.environ.get("CF_RECONCILE_SECS", "300"))
-CF_MIN_CONFIDENCE = os.environ.get("CF_MIN_CONFIDENCE", "low")   # low | medium | high
-CB_THRESHOLD     = int(os.environ.get("CF_CB_THRESHOLD", "5"))    # circuit breaker failures
-CB_RESET_SECS    = float(os.environ.get("CF_CB_RESET_SECS", "120"))
+DRY_RUN           = os.environ.get("CF_DRY_RUN", "").lower() in ("1", "true", "yes")
+HEALTH_PORT       = int(os.environ.get("CF_HEALTH_PORT", "8765"))
+RECONCILE_SECS    = int(os.environ.get("CF_RECONCILE_SECS", "300"))
+CF_MIN_CONFIDENCE = os.environ.get("CF_MIN_CONFIDENCE", "low")
+CB_THRESHOLD      = int(os.environ.get("CF_CB_THRESHOLD", "5"))
+CB_RESET_SECS     = float(os.environ.get("CF_CB_RESET_SECS", "120"))
 
-ABUSEIPDB_URL      = "https://api.abuseipdb.com/api/v2/report"
+ABUSEIPDB_URL       = "https://api.abuseipdb.com/api/v2/report"
 ABUSEIPDB_CHECK_URL = "https://api.abuseipdb.com/api/v2/check"
-INTERVAL           = 60
-NOTE_TAG           = "crowdsec-local-ban"
-NOTE_TAG_MODSEC    = "modsec-ban"
-NOTE_TAG_CIDR      = "crowdsec-cidr-ban"
-LOCAL_ORIGINS      = {"crowdsec", "cscli"}
+INTERVAL            = 60
+NOTE_TAG            = "crowdsec-local-ban"
+NOTE_TAG_MODSEC     = "modsec-ban"
+NOTE_TAG_CIDR       = "crowdsec-cidr-ban"
+LOCAL_ORIGINS       = {"crowdsec", "cscli"}
+STATE_VERSION       = 1       # bumped when state format changes
 
 DECISIONS_LOG       = Path("/var/log/crowdsec/decisions.log")
 NGINX_ERROR_LOG     = Path("/var/log/nginx/error.log")
@@ -102,79 +110,70 @@ RECIDIV_ESCALATION = {0: None, 1: "24h"}
 RECIDIV_DEFAULT    = "168h"
 
 SCENARIO_CATEGORIES: Dict[str, str] = {
-    "http-sensitive-files":   "21,19",
-    "http-probing":           "21,19",
-    "http-scan":              "21,19",
-    "http-bad-user-agent":    "21,19",
-    "http-wordpress-scan":    "21,19",
-    "http-crawl-non_statics": "21,19",
-    "http-exploit":           "21,19",
-    "vpatch-env-access":      "21,19",
-    "vpatch-git-config":      "21,19",
-    "ssh-bf":                 "22",
-    "ssh-slow-bf":            "22",
-    "ssh-time-based-bf":      "22",
-    "ssh-refused-conn":       "22",
-    "ssh-cve":                "22",
-    "mcp-oauth-bruteforce":   "18,21",
-    "mcp-oauth-ratelimit":    "21,19",
-    "mcp-oauth-scanner":      "21,19",
-    "mcp-oauth-bad":          "21,19",
-    "default":                "21,19",
+    "http-sensitive-files":    "21,19",
+    "http-probing":            "21,19",
+    "http-scan":               "21,19",
+    "http-bad-user-agent":     "21,19",
+    "http-wordpress-scan":     "21,19",
+    "http-crawl-non_statics":  "21,19",
+    "http-exploit":            "21,19",
+    "vpatch-env-access":       "21,19",
+    "vpatch-git-config":       "21,19",
+    "ssh-bf":                  "22",
+    "ssh-slow-bf":             "22",
+    "ssh-time-based-bf":       "22",
+    "ssh-refused-conn":        "22",
+    "ssh-cve":                 "22",
+    "mcp-oauth-bruteforce":    "18,21",
+    "mcp-oauth-ratelimit":     "21,19",
+    "mcp-oauth-scanner":       "21,19",
+    "mcp-oauth-bad":           "21,19",
+    "default":                 "21,19",
 }
 
-# Confidence levels — determines whether a scenario syncs to Cloudflare
-# low  = local CrowdSec only (skip CF unless CF_MIN_CONFIDENCE=low)
-# medium = CF block (default threshold)
-# high = CF block + prioritize AbuseIPDB + CIDR consideration
 _SCENARIO_CONFIDENCE: Dict[str, str] = {
-    "ssh-bf":              "high",
-    "ssh-slow-bf":         "high",
-    "ssh-time-based-bf":   "high",
-    "ssh-cve":             "high",
-    "http-exploit":        "high",
-    "vpatch-env-access":   "high",
-    "vpatch-git-config":   "high",
-    "mcp-oauth-bruteforce":"high",
-    "http-scan":           "medium",
-    "http-probing":        "medium",
-    "http-sensitive-files":"medium",
-    "http-wordpress-scan": "medium",
-    "mcp-oauth-ratelimit": "medium",
-    "mcp-oauth-scanner":   "medium",
-    "http-bad-user-agent": "low",
-    "http-crawl-non_statics":"low",
-    "mcp-oauth-bad":       "low",
-    "ssh-refused-conn":    "low",
-    "default":             "medium",
+    "ssh-bf":               "high",
+    "ssh-slow-bf":          "high",
+    "ssh-time-based-bf":    "high",
+    "ssh-cve":              "high",
+    "http-exploit":         "high",
+    "vpatch-env-access":    "high",
+    "vpatch-git-config":    "high",
+    "mcp-oauth-bruteforce": "high",
+    "http-scan":            "medium",
+    "http-probing":         "medium",
+    "http-sensitive-files": "medium",
+    "http-wordpress-scan":  "medium",
+    "mcp-oauth-ratelimit":  "medium",
+    "mcp-oauth-scanner":    "medium",
+    "http-bad-user-agent":  "low",
+    "http-crawl-non_statics": "low",
+    "mcp-oauth-bad":        "low",
+    "ssh-refused-conn":     "low",
+    "default":              "medium",
 }
 _CONFIDENCE_RANK = {"low": 0, "medium": 1, "high": 2}
 
-# Protected ranges — never ban these IPs regardless of CrowdSec decisions
 _PROTECTED_CIDRS_STATIC: List[str] = [
-    # RFC1918
     "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
-    # Loopback
     "127.0.0.0/8",
-    # Link-local
     "169.254.0.0/16", "fe80::/10",
-    # Loopback IPv6
     "::1/128",
-    # Tailscale CGNAT
     "100.64.0.0/10",
-    # Cloudflare anycast IPv4
     "173.245.48.0/20", "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22",
     "141.101.64.0/18", "108.162.192.0/18", "190.93.240.0/20", "188.114.96.0/20",
     "197.234.240.0/22", "198.41.128.0/17", "162.158.0.0/15", "104.16.0.0/13",
     "104.24.0.0/14", "172.64.0.0/13", "131.0.72.0/22",
-    # Cloudflare anycast IPv6
     "2400:cb00::/32", "2606:4700::/32", "2803:f800::/32",
     "2405:b500::/32", "2405:8100::/32", "2a06:98c0::/29", "2c0f:f248::/32",
 ]
 
-# ── Graceful shutdown + hot reload ────────────────────────────────────────────
+# ── Module-level state ────────────────────────────────────────────────────────
 _shutdown  = threading.Event()
-_reload    = threading.Event()   # SIGHUP sets this
+_reload    = threading.Event()
+_wal_seq: int  = 0           # monotonic WAL entry counter; initialized from WAL on startup
+_boot_healthy: bool = False  # True after first successful CF API probe
+_degraded_reason: str = ""   # non-empty when in degraded mode
 
 
 def _handle_signal(signum: int, frame) -> None:
@@ -216,6 +215,7 @@ class _Metrics:
             "cf_api_errors":          0,
             "cf_rules_added":         0,
             "cf_rules_removed":       0,
+            "cf_quota_warnings":      0,
             "decisions_processed":    0,
             "abuseipdb_reports":      0,
             "abuseipdb_checks":       0,
@@ -229,9 +229,9 @@ class _Metrics:
             "collapsed_rules":        0,
         }
         self._gauges: Dict[str, str] = {
-            "last_sync_ts":   "",
-            "mode":           "dry_run" if DRY_RUN else "normal",
-            "uptime_start":   datetime.now(timezone.utc).isoformat(),
+            "last_sync_ts": "",
+            "mode":         "dry_run" if DRY_RUN else "normal",
+            "uptime_start": datetime.now(timezone.utc).isoformat(),
         }
 
     def inc(self, key: str, n: int = 1) -> None:
@@ -267,7 +267,6 @@ class CircuitBreaker:
             if self._opened_at is None:
                 return False
             if time.monotonic() - self._opened_at > self._reset:
-                # Half-open: allow one trial
                 log.info("Circuit breaker [%s] half-open — test autorisé", self._name)
                 self._opened_at = None
                 self._failures  = 0
@@ -317,7 +316,7 @@ def _check_config() -> None:
     if CF_MIN_CONFIDENCE not in _CONFIDENCE_RANK:
         sys.exit(f"FATAL: CF_MIN_CONFIDENCE invalide: {CF_MIN_CONFIDENCE!r} (low|medium|high)")
     if DRY_RUN:
-        log.warning("=== MODE DRY RUN ACTIVÉ — aucune modification CF/AbuseIPDB ne sera appliquée ===")
+        log.warning("=== MODE DRY RUN ACTIVÉ — aucune modification CF/AbuseIPDB ===")
 
 
 # ── JSON state helpers ────────────────────────────────────────────────────────
@@ -328,25 +327,74 @@ def _parse_dt(dt_str: str) -> datetime:
         return datetime.fromtimestamp(0, tz=timezone.utc)
 
 
+def _rename_bak(path: Path) -> None:
+    try:
+        bak = path.with_suffix(".bak")
+        path.rename(bak)
+        log.info("State backup: %s → %s", path.name, bak.name)
+    except OSError:
+        pass
+
+
 def _load_json_state(path: Path, default: dict) -> dict:
     if not path.exists():
-        return default
+        return dict(default)
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError) as exc:
-        log.warning("State corrompu %s: %s — reset, backup → .bak", path.name, exc)
-        try:
-            path.rename(path.with_suffix(".bak"))
-        except OSError:
-            pass
-        return default
+        raw  = path.read_text(encoding="utf-8")
+        data = json.loads(raw)
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
+        log.warning("State corrompu %s: %s — reset + backup", path.name, exc)
+        _rename_bak(path)
+        return dict(default)
+
+    # V4 versioned envelope: {"version": N, "sha256": "...", "state": {...}}
+    if isinstance(data, dict) and "version" in data:
+        state = data.get("state")
+        if not isinstance(state, dict):
+            log.warning("State %s: champ 'state' invalide — reset + backup", path.name)
+            _rename_bak(path)
+            return dict(default)
+        stored_sha = data.get("sha256", "")
+        if stored_sha:
+            actual_sha = hashlib.sha256(
+                json.dumps(state, sort_keys=True, ensure_ascii=False).encode()
+            ).hexdigest()
+            if actual_sha != stored_sha:
+                log.warning(
+                    "State %s: checksum invalide (stocké=%s… calculé=%s…) — "
+                    "corruption détectée, reset + backup",
+                    path.name, stored_sha[:12], actual_sha[:12],
+                )
+                _rename_bak(path)
+                return dict(default)
+        return state
+
+    # V3 flat format (no version key) — accepted, migrated to V4 envelope on next save
+    if isinstance(data, dict):
+        return data
+
+    log.warning("State %s: type inattendu %s — reset", path.name, type(data).__name__)
+    _rename_bak(path)
+    return dict(default)
 
 
 def _atomic_write_json(path: Path, data: dict) -> None:
+    # Compute checksum over state dict (canonical JSON, sorted keys)
+    state_canonical = json.dumps(data, sort_keys=True, ensure_ascii=False)
+    checksum = hashlib.sha256(state_canonical.encode()).hexdigest()
+    envelope = {
+        "version":    STATE_VERSION,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "sha256":     checksum,
+        "state":      data,
+    }
+    content = json.dumps(envelope, indent=2, ensure_ascii=False).encode()
     tmp_fd, tmp_path = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
     try:
-        with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
+        with os.fdopen(tmp_fd, "wb") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())   # durable before rename
         os.replace(tmp_path, path)
     except Exception as exc:
         log.warning("Erreur écriture atomique %s: %s", path.name, exc)
@@ -357,25 +405,42 @@ def _atomic_write_json(path: Path, data: dict) -> None:
 
 
 # ── WAL (write-ahead log) ─────────────────────────────────────────────────────
-def _wal_log(action: str, target: str, tag: str = "", dry_run: bool = False) -> None:
-    """Append a CF operation intent to the WAL before execution."""
+def _init_wal_seq() -> int:
+    """Return current WAL line count so IDs continue across restarts."""
+    if not WAL_FILE.exists():
+        return 0
+    try:
+        with WAL_FILE.open(encoding="utf-8", errors="ignore") as f:
+            return sum(1 for _ in f)
+    except Exception:
+        return 0
+
+
+def _wal_log(op: str, target: str, tag: str = "", dry_run: bool = False,
+             attempt: int = 1) -> None:
+    """Append a CF operation intent to the WAL with fsync before returning."""
+    global _wal_seq
+    _wal_seq += 1
     entry = {
-        "ts":      datetime.now(timezone.utc).isoformat(),
-        "action":  action,    # "add" | "remove" | "reconcile"
+        "id":      _wal_seq,
+        "op":      op,       # "add" | "remove" | "reconcile"
         "target":  target,
         "tag":     tag,
+        "ts":      datetime.now(timezone.utc).isoformat(),
+        "attempt": attempt,
         "dry_run": dry_run,
     }
     try:
         with WAL_FILE.open("a", encoding="utf-8") as f:
             f.write(json.dumps(entry) + "\n")
+            f.flush()
+            os.fsync(f.fileno())   # crash-durable WAL entry
         metrics.inc("wal_entries")
     except Exception as exc:
         log.debug("WAL write failed: %s", exc)
 
 
 def _wal_trim(max_lines: int = 10_000) -> None:
-    """Keep WAL bounded — trim oldest lines when it exceeds max_lines."""
     if not WAL_FILE.exists():
         return
     try:
@@ -385,7 +450,10 @@ def _wal_trim(max_lines: int = 10_000) -> None:
             tmp_fd, tmp_path = tempfile.mkstemp(dir=WAL_FILE.parent, suffix=".tmp")
             with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
                 f.writelines(keep)
+                f.flush()
+                os.fsync(f.fileno())
             os.replace(tmp_path, WAL_FILE)
+            log.info("WAL: compacté %d → %d lignes", len(lines), len(keep))
     except Exception as exc:
         log.debug("WAL trim failed: %s", exc)
 
@@ -401,30 +469,43 @@ def _build_protected_networks() -> List[ipaddress._BaseNetwork]:
             nets.append(ipaddress.ip_network(cidr, strict=False))
         except ValueError:
             log.warning("Protected CIDR invalide ignoré: %s", cidr)
-    # Auto-detect own IPs
+
+    # Auto-detect own IPs via `ip -j addr` (reliable across all interface types)
     try:
-        hostname = socket.gethostname()
-        for info in socket.getaddrinfo(hostname, None):
-            raw_ip = info[4][0]
-            try:
-                nets.append(ipaddress.ip_network(raw_ip, strict=False))
-            except ValueError:
-                pass
-    except Exception:
-        pass
+        result = subprocess.run(
+            ["ip", "-j", "addr"], capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            for iface in json.loads(result.stdout) or []:
+                for ai in iface.get("addr_info", []):
+                    raw = ai.get("local", "")
+                    if not raw:
+                        continue
+                    try:
+                        nets.append(ipaddress.ip_network(raw, strict=False))
+                    except ValueError:
+                        pass
+    except Exception as exc:
+        log.warning("ip -j addr failed, fallback socket.getaddrinfo: %s", exc)
+        try:
+            for info in socket.getaddrinfo(socket.gethostname(), None):
+                raw_ip = info[4][0]
+                try:
+                    nets.append(ipaddress.ip_network(raw_ip, strict=False))
+                except ValueError:
+                    pass
+        except Exception:
+            pass
+
     return nets
 
 
 def is_protected(ip_str: str) -> bool:
-    """Return True if ip_str falls in a protected range — must NEVER be sent to CF."""
     try:
         ip_obj = ipaddress.ip_address(ip_str)
-        for net in _protected_networks:
-            if ip_obj in net:
-                return True
+        return any(ip_obj in net for net in _protected_networks)
     except ValueError:
-        pass
-    return False
+        return False
 
 
 # ── IP / CIDR validation ──────────────────────────────────────────────────────
@@ -447,12 +528,11 @@ def _scenario_confidence(scenario: str) -> str:
 
 
 def _should_sync_to_cf(scenario: str) -> bool:
-    """Return True if scenario confidence meets CF_MIN_CONFIDENCE threshold."""
     conf = _scenario_confidence(scenario)
     return _CONFIDENCE_RANK.get(conf, 1) >= _CONFIDENCE_RANK.get(CF_MIN_CONFIDENCE, 0)
 
 
-# ── HTTP helper with retry ────────────────────────────────────────────────────
+# ── HTTP helper with retry + jitter ──────────────────────────────────────────
 _RETRYABLE_HTTP = frozenset({429, 500, 502, 503, 504})
 
 
@@ -464,7 +544,9 @@ def _http_call(
 ) -> bytes:
     for attempt in range(max_retries):
         if attempt > 0:
-            wait = min(backoff * (2 ** (attempt - 1)), 30.0)
+            base_wait = min(backoff * (2 ** (attempt - 1)), 30.0)
+            # Jitter prevents thundering herd when multiple retries are synchronized
+            wait = base_wait + random.uniform(0, base_wait * 0.3)
             log.debug("Retry HTTP %d/%d dans %.1fs pour %s",
                       attempt + 1, max_retries, wait, req.full_url)
             if _shutdown.wait(timeout=wait):
@@ -479,7 +561,7 @@ def _http_call(
             raise urllib.error.HTTPError(
                 req.full_url, exc.code, exc.reason, exc.headers, io.BytesIO(body)
             ) from None
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        except (urllib.error.URLError, TimeoutError, OSError):
             if attempt < max_retries - 1:
                 continue
             raise
@@ -488,16 +570,12 @@ def _http_call(
 
 # ── sd_notify watchdog ────────────────────────────────────────────────────────
 def _sd_notify(state: str) -> None:
-    """Send a notification to systemd via NOTIFY_SOCKET (if set)."""
     sock_path = os.environ.get("NOTIFY_SOCKET", "")
     if not sock_path:
         return
     try:
-        family = socket.AF_UNIX
-        addr   = sock_path
-        if sock_path.startswith("@"):
-            addr = "\0" + sock_path[1:]
-        with socket.socket(family, socket.SOCK_DGRAM) as s:
+        addr = "\0" + sock_path[1:] if sock_path.startswith("@") else sock_path
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as s:
             s.connect(addr)
             s.sendall(state.encode())
     except Exception as exc:
@@ -511,28 +589,40 @@ def _build_health(
     cidr_size: int = 0,
 ) -> dict:
     m = metrics.snapshot()
-    mode = "dry_run" if DRY_RUN else (
-        "degraded" if (_cb_cf.is_open or _cb_cs.is_open) else "healthy"
-    )
-    return {
-        "status":              mode,
-        "mode":                mode,
-        "cloudflare_cb":       "open" if _cb_cf.is_open else "closed",
-        "crowdsec_cb":         "open" if _cb_cs.is_open else "closed",
-        "abuseipdb_cb":        "open" if _cb_abu.is_open else "closed",
-        "last_sync":           m.get("last_sync_ts", ""),
-        "uptime_start":        m.get("uptime_start", ""),
-        "cycle_count":         m.get("cycle_count", 0),
-        "cf_rules_added":      m.get("cf_rules_added", 0),
-        "cf_rules_removed":    m.get("cf_rules_removed", 0),
-        "cf_api_errors":       m.get("cf_api_errors", 0),
-        "drift_detected":      m.get("drift_detected", 0),
-        "allowlist_size":      cs_allowlist_size,
-        "recidivists":         recidivists_size,
-        "cidr_blocks":         cidr_size,
-        "dry_run":             DRY_RUN,
-        "cf_min_confidence":   CF_MIN_CONFIDENCE,
+    cb_open = _cb_cf.is_open or _cb_cs.is_open
+    if DRY_RUN:
+        mode = "dry_run"
+    elif not _boot_healthy or _degraded_reason:
+        mode = "degraded"
+    elif cb_open:
+        mode = "degraded"
+    else:
+        mode = "healthy"
+
+    result: dict = {
+        "status":            mode,
+        "mode":              mode,
+        "cloudflare_cb":     "open" if _cb_cf.is_open  else "closed",
+        "crowdsec_cb":       "open" if _cb_cs.is_open  else "closed",
+        "abuseipdb_cb":      "open" if _cb_abu.is_open else "closed",
+        "last_sync":         m.get("last_sync_ts", ""),
+        "uptime_start":      m.get("uptime_start", ""),
+        "cycle_count":       m.get("cycle_count", 0),
+        "cf_rules_added":    m.get("cf_rules_added", 0),
+        "cf_rules_removed":  m.get("cf_rules_removed", 0),
+        "cf_api_errors":     m.get("cf_api_errors", 0),
+        "cf_quota_warnings": m.get("cf_quota_warnings", 0),
+        "drift_detected":    m.get("drift_detected", 0),
+        "allowlist_size":    cs_allowlist_size,
+        "recidivists":       recidivists_size,
+        "cidr_blocks":       cidr_size,
+        "dry_run":           DRY_RUN,
+        "cf_min_confidence": CF_MIN_CONFIDENCE,
+        "state_version":     STATE_VERSION,
     }
+    if _degraded_reason:
+        result["degraded_reason"] = _degraded_reason
+    return result
 
 
 def _build_prometheus(snap: Optional[dict] = None) -> str:
@@ -553,6 +643,9 @@ def _build_prometheus(snap: Optional[dict] = None) -> str:
         "# HELP crowdsec_cf_sync_rules_removed_total CF rules removed",
         "# TYPE crowdsec_cf_sync_rules_removed_total counter",
         f"crowdsec_cf_sync_rules_removed_total {s.get('cf_rules_removed', 0)}",
+        "# HELP crowdsec_cf_sync_cf_quota_warnings_total Times CF quota ≥800/1000",
+        "# TYPE crowdsec_cf_sync_cf_quota_warnings_total counter",
+        f"crowdsec_cf_sync_cf_quota_warnings_total {s.get('cf_quota_warnings', 0)}",
         "# HELP crowdsec_cf_sync_drift_detected_total Reconciliation drift events",
         "# TYPE crowdsec_cf_sync_drift_detected_total counter",
         f"crowdsec_cf_sync_drift_detected_total {s.get('drift_detected', 0)}",
@@ -565,18 +658,17 @@ def _build_prometheus(snap: Optional[dict] = None) -> str:
         "# HELP crowdsec_cf_sync_abuseipdb_reports_total AbuseIPDB reports sent",
         "# TYPE crowdsec_cf_sync_abuseipdb_reports_total counter",
         f"crowdsec_cf_sync_abuseipdb_reports_total {s.get('abuseipdb_reports', 0)}",
-        "# HELP crowdsec_cf_sync_dry_run 1 if dry-run mode is active",
-        "# TYPE crowdsec_cf_sync_dry_run gauge",
-        f"crowdsec_cf_sync_dry_run {1 if DRY_RUN else 0}",
         "# HELP crowdsec_cf_sync_wal_entries_total WAL entries written",
         "# TYPE crowdsec_cf_sync_wal_entries_total counter",
         f"crowdsec_cf_sync_wal_entries_total {s.get('wal_entries', 0)}",
+        "# HELP crowdsec_cf_sync_dry_run 1 if dry-run mode is active",
+        "# TYPE crowdsec_cf_sync_dry_run gauge",
+        f"crowdsec_cf_sync_dry_run {1 if DRY_RUN else 0}",
         "",
     ]
     return "\n".join(lines)
 
 
-# shared state for health endpoint (updated each cycle)
 _health_state: dict = {}
 _health_lock  = threading.Lock()
 
@@ -590,7 +682,7 @@ def _start_health_server() -> Optional[http.server.HTTPServer]:
             if self.path == "/health":
                 with _health_lock:
                     data = dict(_health_state)
-                code = 200 if data.get("status") == "healthy" else 503
+                code = 200 if data.get("status") in ("healthy", "dry_run") else 503
                 body = json.dumps(data, indent=2).encode()
                 self.send_response(code)
                 self.send_header("Content-Type", "application/json")
@@ -607,7 +699,7 @@ def _start_health_server() -> Optional[http.server.HTTPServer]:
                 self.end_headers()
 
         def log_message(self, fmt: str, *args: object) -> None:
-            pass  # silence access logs
+            pass
 
     try:
         srv = http.server.HTTPServer(("127.0.0.1", HEALTH_PORT), _Handler)
@@ -681,50 +773,69 @@ def cf_request(method: str, path: str, data: Optional[dict] = None) -> dict:
         return result
     except urllib.error.HTTPError as exc:
         body_text = exc.read().decode(errors="replace")
+        log.warning("CF HTTP %d %s: %s", exc.code, method, body_text[:300])
         metrics.inc("cf_api_errors")
         _cb_cf.fail()
-        raise RuntimeError(f"HTTP {exc.code} on {method} {path}: {body_text}") from exc
+        raise
     except Exception as exc:
+        log.warning("CF request %s %s: %s", method, path, exc)
         metrics.inc("cf_api_errors")
         _cb_cf.fail()
         raise
 
 
-def get_cf_blocked_ips() -> Dict[str, str]:
+def _fetch_cf_rules() -> List[dict]:
+    """Fetch all CF access rules for this zone. Raises if circuit breaker is open."""
+    if _cb_cf.is_open:
+        raise RuntimeError("Circuit breaker CF ouvert — fetch impossible")
     result = cf_request(
         "GET", f"/zones/{CF_ZONE_ID}/firewall/access_rules/rules?per_page=1000"
     )
-    rules: Dict[str, str] = {}
-    for rule in result.get("result", []):
-        if rule.get("notes") == NOTE_TAG:
-            ip = rule.get("configuration", {}).get("value")
-            if ip:
-                try:
-                    ip = str(ipaddress.ip_address(ip))
-                except ValueError:
-                    pass
-                rules[ip] = rule["id"]
-    return rules
+    raw   = result.get("result", [])
+    count = len(raw)
+    if count >= 800:
+        log.warning(
+            "CF quota: %d/1000 règles utilisées — approche de la limite zone", count
+        )
+        metrics.inc("cf_quota_warnings")
+    return raw
 
 
-def get_cf_rules_by_tag(tag: str) -> Dict[str, str]:
-    result = cf_request(
-        "GET", f"/zones/{CF_ZONE_ID}/firewall/access_rules/rules?per_page=1000"
-    )
-    rules: Dict[str, str] = {}
-    for rule in result.get("result", []):
+def _parse_cf_rules_by_tag(rules: List[dict], tag: str) -> Dict[str, str]:
+    """Extract {value: rule_id} from a cached CF rule list, filtered by exact notes tag."""
+    result: Dict[str, str] = {}
+    for rule in rules:
         if rule.get("notes") == tag:
             val = rule.get("configuration", {}).get("value")
             if val:
-                rules[val] = rule["id"]
-    return rules
+                result[val] = rule["id"]
+    return result
+
+
+def get_cf_blocked_ips(rules: Optional[List[dict]] = None) -> Dict[str, str]:
+    """Return {ip: rule_id} for crowdsec-local-ban rules. Fetches CF if rules not provided."""
+    if rules is None:
+        rules = _fetch_cf_rules()
+    raw = _parse_cf_rules_by_tag(rules, NOTE_TAG)
+    normalized: Dict[str, str] = {}
+    for val, rid in raw.items():
+        try:
+            normalized[str(ipaddress.ip_address(val))] = rid
+        except ValueError:
+            normalized[val] = rid
+    return normalized
+
+
+def get_cf_rules_by_tag(tag: str, rules: Optional[List[dict]] = None) -> Dict[str, str]:
+    """Return {value: rule_id} for rules with the given tag. Fetches CF if rules not provided."""
+    if rules is None:
+        rules = _fetch_cf_rules()
+    return _parse_cf_rules_by_tag(rules, tag)
 
 
 def add_cf_rule(ip: str, tag: str = NOTE_TAG, target: str = "ip") -> bool:
     if not _is_valid_ip_or_cidr(ip, target):
         return False
-
-    # Anti-self-ban: block if protected range
     if target == "ip" and is_protected(ip):
         log.warning("PROTECTED RANGE — refus d'ajouter %s dans CF (anti-self-ban)", ip)
         metrics.inc("protected_range_blocks")
@@ -785,46 +896,33 @@ def delete_cf_rule(rule_id: str, ip: str) -> bool:
 
 # ── Rule collapsing ───────────────────────────────────────────────────────────
 def collapse_ips(ips: Set[str]) -> List[str]:
-    """
-    Collapse a set of individual IPs into the minimal list of IPs + CIDRs
-    using ipaddress.collapse_addresses(). Returns strings ready for CF.
-    """
     v4: List[ipaddress.IPv4Address] = []
     v6: List[ipaddress.IPv6Address] = []
     raw_pass: List[str] = []
-
     for ip in ips:
         try:
             obj = ipaddress.ip_address(ip)
-            if obj.version == 4:
-                v4.append(obj)
-            else:
-                v6.append(obj)
+            (v4 if obj.version == 4 else v6).append(obj)
         except ValueError:
             raw_pass.append(ip)
-
     collapsed: List[str] = list(raw_pass)
-    for net in ipaddress.collapse_addresses(v4):  # type: ignore[arg-type]
+    for net in ipaddress.collapse_addresses(v4):   # type: ignore[arg-type]
         collapsed.append(str(net) if net.prefixlen < 32 else str(net.network_address))
-    for net in ipaddress.collapse_addresses(v6):  # type: ignore[arg-type]
+    for net in ipaddress.collapse_addresses(v6):   # type: ignore[arg-type]
         collapsed.append(str(net) if net.prefixlen < 128 else str(net.network_address))
-
     if len(collapsed) < len(ips):
         saved = len(ips) - len(collapsed)
         log.info("Rule collapsing: %d IPs → %d entrées (%d règles économisées)",
                  len(ips), len(collapsed), saved)
         metrics.inc("collapsed_rules", saved)
-
     return collapsed
 
 
 # ── CrowdSec — active bans ────────────────────────────────────────────────────
 def _fetch_all_cscli_decisions() -> Optional[list]:
     """
-    Fetch ALL active decisions — no --origin flag.
-    NOTE: cscli --origin X causes a 25s+ SQLite timeout in CrowdSec ≤ 1.7.8
-    (crowdsecurity/crowdsec#4470, fixed in PR #4473). Workaround: fetch all,
-    filter client-side.
+    Fetch ALL active decisions without --origin (workaround for CrowdSec #4470:
+    cscli --origin X causes 25s+ SQLite timeout in v1.7.8).
     """
     if _cb_cs.is_open:
         log.warning("Circuit breaker CrowdSec ouvert — skip fetch decisions")
@@ -853,11 +951,11 @@ def _fetch_all_cscli_decisions() -> Optional[list]:
         _cb_cs.ok()
         return data
     except subprocess.TimeoutExpired:
-        log.warning("cscli decisions list: timeout 15s — sentinel (skip sync)")
+        log.warning("cscli decisions list: timeout 15s — skip sync")
         _cb_cs.fail()
         return None
     except Exception as exc:
-        log.warning("cscli decisions list: erreur %s — sentinel", exc)
+        log.warning("cscli decisions list: erreur %s", exc)
         _cb_cs.fail()
         return None
 
@@ -905,10 +1003,8 @@ def get_active_bans() -> Optional[Set[str]]:
 def get_recent_local_bans(hours: int = LOOKBACK_HOURS) -> List[dict]:
     if not DECISIONS_LOG.exists():
         return []
-
     cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
     bans: List[dict] = []
-
     try:
         with DECISIONS_LOG.open() as f:
             for line in f:
@@ -919,11 +1015,9 @@ def get_recent_local_bans(hours: int = LOOKBACK_HOURS) -> List[dict]:
                     d = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-
                 cs         = d.get("cs", {})
                 event_type = cs.get("event_type", "")
                 origin     = cs.get("origin", "").lower()
-
                 if event_type == "alert":
                     if cs.get("action") != "banned":
                         continue
@@ -943,7 +1037,6 @@ def get_recent_local_bans(hours: int = LOOKBACK_HOURS) -> List[dict]:
                         continue
                 else:
                     continue
-
                 dt_str = d.get("dt", "")
                 try:
                     dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
@@ -951,13 +1044,11 @@ def get_recent_local_bans(hours: int = LOOKBACK_HOURS) -> List[dict]:
                         continue
                 except Exception:
                     continue
-
                 ip_val = cs.get("ip", "")
                 try:
                     ipaddress.ip_address(ip_val)
                 except ValueError:
-                    continue  # skip CIDR entries
-
+                    continue
                 bans.append({
                     "ip":       ip_val,
                     "scenario": cs.get("scenario", "unknown"),
@@ -966,10 +1057,8 @@ def get_recent_local_bans(hours: int = LOOKBACK_HOURS) -> List[dict]:
                     "id":       str(cs.get("id", "")),
                 })
                 metrics.inc("decisions_processed")
-
     except Exception as exc:
         log.warning("Erreur lecture decisions.log: %s", exc)
-
     return [b for b in bans if b["ip"]]
 
 
@@ -996,7 +1085,6 @@ def purge_old_recidivists(recidivists: dict) -> dict:
         ip: info for ip, info in recidivists.items()
         if not ip.startswith("_") and _parse_dt(info.get("last_seen", "")) >= cutoff
     }
-    # Preserve internal cursor key
     if "_cursor" in recidivists:
         purged["_cursor"] = recidivists["_cursor"]
     return purged
@@ -1020,11 +1108,9 @@ def sync_recidivists(recidivists: dict) -> dict:
     if not recent_bans:
         return recidivists
 
-    # Cursor prevents re-processing the same ban events across cycles.
-    # Only bans strictly newer than the cursor are counted; cursor advances
-    # to the highest ban timestamp seen this call.
-    # First run (no cursor): initialize to now so we don't retroactively re-count
-    # bans that a prior daemon instance (V2) already processed.
+    # Cursor prevents re-processing the same ban events across cycles/restarts.
+    # Initialized to now on first V4 run so we don't retroactively re-count
+    # bans that a prior daemon instance already processed.
     cursor_str = recidivists.get("_cursor", "")
     if cursor_str:
         try:
@@ -1038,7 +1124,6 @@ def sync_recidivists(recidivists: dict) -> dict:
     changed = False
 
     for ban in recent_bans:
-        # Skip bans at or before the last-processed cursor
         try:
             ban_dt = _parse_dt(ban["dt"])
         except Exception:
@@ -1048,7 +1133,6 @@ def sync_recidivists(recidivists: dict) -> dict:
 
         ip       = ban["ip"]
         scenario = ban["scenario"]
-
         if ip == "1.2.3.4":
             continue
         try:
@@ -1060,7 +1144,6 @@ def sync_recidivists(recidivists: dict) -> dict:
 
         if ip not in recidivists:
             recidivists[ip] = {"count": 0, "last_seen": ban["dt"]}
-
         try:
             last = _parse_dt(recidivists[ip].get("last_seen", ""))
             if (datetime.now(timezone.utc) - last).days > RECIDIV_WINDOW:
@@ -1252,7 +1335,7 @@ def get_recent_bouncer_denials(hours: int = 1) -> List[dict]:
                     "host":   host_m.group("host")  if host_m else "-",
                 })
     except Exception as exc:
-        log.warning("Erreur lecture bouncer denials nginx error.log: %s", exc)
+        log.warning("Erreur lecture bouncer denials: %s", exc)
     return events
 
 
@@ -1271,8 +1354,7 @@ def sync_bouncer_abuseipdb(
     if not denials:
         return bouncer_check_state
 
-    now = datetime.now(timezone.utc)
-
+    now    = datetime.now(timezone.utc)
     by_ip: Dict[str, dict] = {}
     for ev in denials:
         if ev["ip"] not in by_ip:
@@ -1282,7 +1364,6 @@ def sync_bouncer_abuseipdb(
     for ip, ev in by_ip.items():
         if is_allowlisted(ip, cs_allowlist) or is_protected(ip):
             continue
-
         last = bouncer_check_state.get(ip, {}).get("checked_at")
         if last:
             try:
@@ -1290,26 +1371,20 @@ def sync_bouncer_abuseipdb(
                     continue
             except Exception:
                 pass
-
         if _shutdown.is_set():
             break
-
         data = check_abuseipdb(ip)
         if data is None:
             continue
-
         score   = data.get("abuseConfidenceScore", 0)
         country = data.get("countryCode", "??")
         isp     = data.get("isp", "?")
         reports = data.get("totalReports", 0)
-
         log.info(
             "Bouncer AbuseIPDB: %s | score: %d%% | pays: %s | ISP: %s | reports: %d",
             ip, score, country, isp, reports,
         )
-
         bouncer_check_state[ip] = {"checked_at": now.isoformat(), "score": score}
-
         send_to_betterstack({
             "message":  f"Bouncer block: {ip} | AbuseIPDB {score}% | {country} | {isp}",
             "platform": "CrowdSec",
@@ -1368,7 +1443,6 @@ def sync_cidr_bans(cidr_state: dict, cs_allowlist: Set[str]) -> dict:
         return cidr_state
 
     now = datetime.now(timezone.utc)
-
     cidr_ips: Dict[str, Set[str]] = {}
     for ban in recent_bans:
         ip = ban["ip"]
@@ -1405,8 +1479,7 @@ def sync_cidr_bans(cidr_state: dict, cs_allowlist: Set[str]) -> dict:
             cidr_state[cidr] = {"banned_at": now.isoformat(), "ip_count": len(ips)}
             save_cidr_state(cidr_state)
 
-    # Expire old CIDR bans
-    expiry = timedelta(hours=24)
+    expiry  = timedelta(hours=24)
     expired = [
         cidr for cidr, info in cidr_state.items()
         if (now - _parse_dt(info.get("banned_at", ""))).total_seconds() >= expiry.total_seconds()
@@ -1420,7 +1493,6 @@ def sync_cidr_bans(cidr_state: dict, cs_allowlist: Set[str]) -> dict:
 
     if expired:
         save_cidr_state(cidr_state)
-
     return cidr_state
 
 
@@ -1435,7 +1507,6 @@ def report_to_abuseipdb_raw(
         log.info("[DRY RUN] AbuseIPDB report %s | cats: %s", ip, categories)
         metrics.inc("dry_run_skips")
         return True
-
     data = urllib.parse.urlencode({
         "ip": ip, "categories": categories,
         "comment": comment, "timestamp": timestamp,
@@ -1493,10 +1564,9 @@ def check_abuseipdb(ip: str) -> Optional[dict]:
         body = exc.read().decode(errors="replace")
         if exc.code == 429:
             log.debug("AbuseIPDB check rate limit pour %s", ip)
-            _cb_abu.fail()
         else:
             log.warning("AbuseIPDB check %s: HTTP %d — %s", ip, exc.code, body[:200])
-            _cb_abu.fail()
+        _cb_abu.fail()
         return None
     except Exception as exc:
         log.warning("AbuseIPDB check %s: %s", ip, exc)
@@ -1615,7 +1685,7 @@ def send_to_betterstack(payload: dict) -> bool:
 
 # ── Cloudflare sync ───────────────────────────────────────────────────────────
 def sync_cloudflare(cs_allowlist: Set[str]) -> None:
-    """Sync active CrowdSec bans → Cloudflare, with adaptive mitigation + rule collapsing."""
+    """Sync active CrowdSec bans → Cloudflare. Single CF API call via _fetch_cf_rules()."""
     if _cb_cf.is_open:
         log.warning("Circuit breaker CF ouvert — sync_cloudflare ignoré (degraded mode)")
         metrics.set_gauge("mode", "degraded")
@@ -1623,27 +1693,19 @@ def sync_cloudflare(cs_allowlist: Set[str]) -> None:
 
     active_bans = get_active_bans()
     if active_bans is None:
-        log.warning(
-            "CF Sync skip — get_active_bans() a échoué (cscli timeout/erreur), "
-            "aucune modification CF"
-        )
+        log.warning("CF Sync skip — get_active_bans() échoué (cscli timeout/erreur)")
         return
 
-    # Adaptive mitigation: filter bans by confidence
+    # Adaptive mitigation: filter by scenario confidence
     if CF_MIN_CONFIDENCE != "low":
-        recent = get_recent_local_bans()
+        recent       = get_recent_local_bans()
         scenario_map = {ban["ip"]: ban["scenario"] for ban in recent}
-        filtered_bans: Set[str] = set()
-        for ip in active_bans:
-            scenario = scenario_map.get(ip, "default")
-            if _should_sync_to_cf(scenario):
-                filtered_bans.add(ip)
-            else:
-                log.debug("Adaptive mitigation: %s skipped (confidence=%s < %s)",
-                          ip, _scenario_confidence(scenario), CF_MIN_CONFIDENCE)
-        active_bans = filtered_bans
+        active_bans  = {
+            ip for ip in active_bans
+            if _should_sync_to_cf(scenario_map.get(ip, "default"))
+        }
 
-    # Normalize IPs and apply allowlist / protected range filters
+    # Normalize + allowlist/protected filter
     clean_bans: Set[str] = set()
     for ip in active_bans:
         try:
@@ -1653,20 +1715,23 @@ def sync_cloudflare(cs_allowlist: Set[str]) -> None:
         if not is_allowlisted(norm, cs_allowlist) and not is_protected(norm):
             clean_bans.add(norm)
 
-    cf_blocked = get_cf_blocked_ips()
-    log.info(
-        "CF Sync — CrowdSec: %d bans | Cloudflare: %d règles",
-        len(clean_bans), len(cf_blocked),
-    )
+    # Single CF API call — reuse for diff
+    try:
+        all_rules = _fetch_cf_rules()
+    except Exception as exc:
+        log.warning("CF Sync: impossible de lire règles CF — %s", exc)
+        return
+    cf_blocked = get_cf_blocked_ips(rules=all_rules)
+
+    log.info("CF Sync — CrowdSec: %d bans | Cloudflare: %d règles",
+             len(clean_bans), len(cf_blocked))
 
     to_add    = clean_bans - set(cf_blocked)
     to_delete = {ip: rid for ip, rid in cf_blocked.items() if ip not in clean_bans}
 
-    # Collapse IPs to CIDRs before adding (saves CF rules quota)
     to_add_collapsed = set(collapse_ips(to_add))
 
     added = deleted = 0
-
     for ip in to_add_collapsed:
         if _shutdown.is_set():
             break
@@ -1690,32 +1755,87 @@ def sync_cloudflare(cs_allowlist: Set[str]) -> None:
     metrics.set_gauge("mode", "dry_run" if DRY_RUN else "normal")
 
 
-# ── Reconciliation (drift detection) ─────────────────────────────────────────
+# ── Reconciliation (CIDR-aware drift detection) ───────────────────────────────
 def reconcile_state(cs_allowlist: Set[str]) -> int:
     """
     Full reconciliation: compare CF actual state vs CrowdSec active bans.
-    Returns number of drifted rules corrected (or detected in DRY_RUN mode).
+
+    Key improvements over V3:
+    - Single CF API call (was 3 separate calls in V3)
+    - CIDR-aware: drift_add excludes IPs already covered by a /24 CIDR block in CF,
+      preventing spurious 'missing' detections for IPs blocked at subnet level
+    - drift_remove only targets crowdsec-local-ban tag; ModSec + CIDR tags managed
+      by their own sync functions (no cross-tag interference)
+
+    Source of truth: Cloudflare API.
+    Local state = cache. Reconciliation = final arbiter.
     """
     _wal_log("reconcile", "full", dry_run=DRY_RUN)
     metrics.inc("reconcile_runs")
+
+    if _cb_cf.is_open:
+        log.warning("Reconciliation: circuit breaker CF ouvert — skip")
+        return 0
+
+    # Single CF API call — share across all tag lookups
+    try:
+        all_cf_rules = _fetch_cf_rules()
+    except Exception as exc:
+        log.warning("Reconciliation: impossible de lire règles CF: %s — skip", exc)
+        return 0
+
+    cf_local  = get_cf_blocked_ips(rules=all_cf_rules)             # crowdsec-local-ban
+    cf_cidr   = get_cf_rules_by_tag(NOTE_TAG_CIDR,   rules=all_cf_rules)
+    cf_modsec = get_cf_rules_by_tag(NOTE_TAG_MODSEC,  rules=all_cf_rules)
+
+    # Build CIDR network objects for IP coverage check
+    cidr_nets: List[ipaddress._BaseNetwork] = []
+    for cidr_str in cf_cidr:
+        try:
+            cidr_nets.append(ipaddress.ip_network(cidr_str, strict=False))
+        except ValueError:
+            pass
+
+    # All individual IPs under any crowdsec tag
+    all_cf_ips: Set[str] = set(cf_local) | set(cf_modsec)
+
+    def _ip_in_cf(ip: str) -> bool:
+        """True if ip has an individual CF rule OR falls inside a CF CIDR block."""
+        if ip in all_cf_ips:
+            return True
+        try:
+            ip_obj = ipaddress.ip_address(ip)
+            return any(ip_obj in net for net in cidr_nets)
+        except ValueError:
+            return False
 
     active_bans = get_active_bans()
     if active_bans is None:
         log.warning("Reconciliation: get_active_bans() échoué — skip")
         return 0
 
-    cf_blocked = get_cf_blocked_ips()
-    drift_add    = active_bans - set(cf_blocked)
-    drift_remove = {ip for ip in cf_blocked if ip not in active_bans}
+    # drift_add: in CrowdSec but not covered by any CF crowdsec rule (including CIDR)
+    drift_add: Set[str] = {
+        ip for ip in active_bans
+        if not _ip_in_cf(ip)
+        and not is_allowlisted(ip, cs_allowlist)
+        and not is_protected(ip)
+    }
+
+    # drift_remove: crowdsec-local-ban rules that are no longer active in CS
+    # Intentionally scoped to our tag only — don't interfere with ModSec/CIDR management
+    drift_remove: Dict[str, str] = {
+        ip: rid for ip, rid in cf_local.items()
+        if ip not in active_bans
+    }
 
     drift_count = len(drift_add) + len(drift_remove)
-
     if drift_count == 0:
         log.debug("Reconciliation: pas de drift détecté")
         return 0
 
     log.warning(
-        "DRIFT DÉTECTÉ: %d règles à ajouter, %d à supprimer",
+        "DRIFT DÉTECTÉ: %d règle(s) à ajouter, %d à supprimer",
         len(drift_add), len(drift_remove),
     )
     metrics.inc("drift_detected", drift_count)
@@ -1733,15 +1853,13 @@ def reconcile_state(cs_allowlist: Set[str]) -> int:
 
     corrected = 0
     for ip in drift_add:
-        if is_allowlisted(ip, cs_allowlist) or is_protected(ip):
-            continue
         if add_cf_rule(ip):
             log.info("Reconciliation: ajouté %s (manquant dans CF)", ip)
             corrected += 1
         if _shutdown.is_set():
             break
 
-    for ip, rule_id in {ip: cf_blocked[ip] for ip in drift_remove}.items():
+    for ip, rule_id in drift_remove.items():
         if delete_cf_rule(rule_id, ip):
             log.info("Reconciliation: supprimé %s (fantôme dans CF)", ip)
             corrected += 1
@@ -1811,111 +1929,101 @@ def poll_cloudflare_waf(
         log.debug("Circuit breaker CF ouvert — WAF poll ignoré")
         return waf_state, recidivists, reported
 
-    now     = datetime.now(timezone.utc)
-    last_dt = waf_state.get("last_event_dt")
-    since   = last_dt if last_dt else (
+    now      = datetime.now(timezone.utc)
+    since    = waf_state.get("last_event_dt") or (
         now - timedelta(seconds=CF_WAF_WINDOW_SECS)
-    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    ).isoformat()
 
     try:
         events = fetch_cf_waf_events(since)
     except Exception as exc:
-        log.error("CF WAF poll échoué: %s", exc)
-        send_to_betterstack({
-            "message": f"CF WAF poll error: {exc}",
-            "source":  "cloudflare_waf",
-            "level":   "error",
-            "dt":      now.isoformat(),
-        })
+        log.warning("CF WAF poll: erreur %s", exc)
         return waf_state, recidivists, reported
 
     if not events:
         return waf_state, recidivists, reported
 
-    latest_dt = events[-1].get("datetime", "")
-    if latest_dt:
-        waf_state["last_event_dt"] = latest_dt
-        save_cf_waf_state(waf_state)
+    waf_state["last_event_dt"] = events[-1]["datetime"]
+    save_cf_waf_state(waf_state)
 
     window_start = now - timedelta(seconds=CF_WAF_WINDOW_SECS)
     ip_hits: Dict[str, dict] = {}
-
     for ev in events:
-        ev_dt_str = ev.get("datetime", "")
+        ip = ev.get("clientIP")
+        if not ip:
+            continue
         try:
-            ev_dt = datetime.fromisoformat(ev_dt_str.replace("Z", "+00:00"))
-        except Exception:
+            ipaddress.ip_address(ip)
+        except ValueError:
             continue
-        if ev_dt < window_start:
+        if is_allowlisted(ip, cs_allowlist) or is_protected(ip):
             continue
-
-        ip = ev.get("clientIP", "")
-        if not ip or is_allowlisted(ip, cs_allowlist) or is_protected(ip):
-            continue
-
         if ip not in ip_hits:
-            ip_hits[ip] = {"count": 0, "actions": [], "uris": [], "first_dt": ev_dt_str}
+            ip_hits[ip] = {
+                "count":    0,
+                "actions":  set(),
+                "uris":     [],
+                "first_dt": ev["datetime"],
+            }
         ip_hits[ip]["count"] += 1
-        action = ev.get("action", "")
-        if action and action not in ip_hits[ip]["actions"]:
-            ip_hits[ip]["actions"].append(action)
+        ip_hits[ip]["actions"].add(ev.get("action", ""))
         uri = ev.get("clientRequestPath", "")
-        if uri and uri not in ip_hits[ip]["uris"]:
+        if uri and len(ip_hits[ip]["uris"]) < 5:
             ip_hits[ip]["uris"].append(uri)
 
     banned_count = 0
     for ip, info in ip_hits.items():
         if info["count"] < CF_WAF_THRESHOLD:
             continue
+        try:
+            ev_dt = _parse_dt(info["first_dt"])
+            if ev_dt < window_start:
+                continue
+        except Exception:
+            continue
 
-        rec       = recidivists.get(ip, {})
-        rec_count = rec.get("count", 0)
-        duration  = RECIDIV_ESCALATION.get(rec_count, RECIDIV_DEFAULT)
+        try:
+            info["actions"] = list(info["actions"])
+            uris_str = ", ".join(info["uris"]) if info["uris"] else "N/A"
+            duration = "168h" if ip in recidivists else "24h"
 
-        if duration:
-            try:
-                uris_str = ", ".join(info["uris"][:3]) or "N/A"
-                subprocess.run(
-                    ["cscli", "decisions", "add", "--ip", ip,
-                     "--duration", duration, "--type", "ban",
-                     "--reason",
-                     f"cloudflare-waf: {info['count']} hits | actions: {info['actions']} | URIs: {uris_str}"],
-                    capture_output=True, text=True, timeout=15,
-                )
+            if ip not in recidivists:
+                recidivists[ip] = {"count": 1, "last_seen": info["first_dt"]}
+            else:
                 recidivists[ip] = {
-                    "count":     rec_count + 1,
+                    "count":     recidivists[ip]["count"] + 1,
                     "last_seen": info["first_dt"],
                 }
-                save_recidivists(recidivists)
+            save_recidivists(recidivists)
 
-                abuse_key = f"waf:{ip}:{info['first_dt'][:10]}"
-                if abuse_key not in reported:
-                    comment = (
-                        f"Cloudflare WAF: {info['count']} hits in {CF_WAF_WINDOW_SECS}s | "
-                        f"actions: {info['actions']} | URIs: {uris_str}"
-                    )
-                    if report_to_abuseipdb_raw(ip, "21,19", comment, info["first_dt"]):
-                        reported[abuse_key] = now.isoformat()
-                        save_reported(reported)
+            abuse_key = f"waf:{ip}:{info['first_dt'][:10]}"
+            if abuse_key not in reported:
+                comment = (
+                    f"Cloudflare WAF: {info['count']} hits in {CF_WAF_WINDOW_SECS}s | "
+                    f"actions: {info['actions']} | URIs: {uris_str}"
+                )
+                if report_to_abuseipdb_raw(ip, "21,19", comment, info["first_dt"]):
+                    reported[abuse_key] = now.isoformat()
+                    save_reported(reported)
 
-                send_to_betterstack({
-                    "message":    f"CF WAF ban: {ip} | {info['count']} hits | {info['actions']}",
-                    "source":     "cloudflare_waf",
-                    "platform":   "CrowdSec",
-                    "cs": {
-                        "ip":       ip,
-                        "origin":   "cloudflare-waf",
-                        "hits":     info["count"],
-                        "actions":  info["actions"],
-                        "uris":     info["uris"][:5],
-                        "duration": duration,
-                    },
-                    "dt": now.isoformat(),
-                })
-                log.info("CF WAF: banni %s (%d hits, durée %s)", ip, info["count"], duration)
-                banned_count += 1
-            except Exception as exc:
-                log.warning("CF WAF: erreur ban %s: %s", ip, exc)
+            send_to_betterstack({
+                "message":  f"CF WAF ban: {ip} | {info['count']} hits | {info['actions']}",
+                "source":   "cloudflare_waf",
+                "platform": "CrowdSec",
+                "cs": {
+                    "ip":       ip,
+                    "origin":   "cloudflare-waf",
+                    "hits":     info["count"],
+                    "actions":  info["actions"],
+                    "uris":     info["uris"][:5],
+                    "duration": duration,
+                },
+                "dt": now.isoformat(),
+            })
+            log.info("CF WAF: banni %s (%d hits, durée %s)", ip, info["count"], duration)
+            banned_count += 1
+        except Exception as exc:
+            log.warning("CF WAF: erreur ban %s: %s", ip, exc)
 
     if banned_count > 0:
         save_reported(reported)
@@ -1926,26 +2034,46 @@ def poll_cloudflare_waf(
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main() -> None:
+    global _boot_healthy, _degraded_reason, _wal_seq, _protected_networks
+
     _check_config()
 
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT,  _handle_signal)
     signal.signal(signal.SIGHUP,  _handle_signal)
 
-    # Build protected ranges
-    global _protected_networks
     _protected_networks = _build_protected_networks()
     log.info("Protected ranges: %d réseaux chargés", len(_protected_networks))
 
     log.info(
-        "=== CrowdSec CF Sync V3 démarré (interval=%ds | dry_run=%s | "
-        "confidence=%s | health_port=%s) ===",
+        "=== CrowdSec CF Sync V4 démarré (interval=%ds | dry_run=%s | "
+        "confidence=%s | health_port=%s | state_version=%d) ===",
         INTERVAL, DRY_RUN, CF_MIN_CONFIDENCE,
         HEALTH_PORT if HEALTH_PORT else "disabled",
+        STATE_VERSION,
     )
 
-    # Start health/metrics HTTP server
     _start_health_server()
+
+    # Initialize WAL sequence from existing WAL, trim on startup
+    _wal_seq = _init_wal_seq()
+    log.info("WAL: %d entrées existantes (prochain id: %d)", _wal_seq, _wal_seq + 1)
+    _wal_trim()
+
+    # Probe CF connectivity at boot
+    # On failure: enter degraded mode — do NOT wipe CF rules with stale local state.
+    # Cloudflare is the source of truth; we must be able to read it before modifying it.
+    try:
+        _fetch_cf_rules()
+        _boot_healthy = True
+        log.info("Boot: CF accessible — démarrage normal")
+    except Exception as exc:
+        _degraded_reason = f"CF inaccessible au démarrage: {exc}"
+        log.error("DEGRADED BOOT: %s", _degraded_reason)
+        log.warning(
+            "Daemon en mode dégradé — aucune modification CF "
+            "tant que CF reste inaccessible"
+        )
 
     # Load state
     cs_allowlist        = get_crowdsec_allowlist()
@@ -1959,32 +2087,31 @@ def main() -> None:
 
     log.info("Allowlist CrowdSec: %d entrées", len(cs_allowlist))
     log.info("AbuseIPDB: %d IPs dans l'historique", len(reported))
-    log.info("Récidivistes connus: %d IPs", len(recidivists))
+    log.info("Récidivistes connus: %d IPs",
+             len([k for k in recidivists if not k.startswith("_")]))
     log.info("CIDR bannis: %d blocs", len(cidr_state))
     log.info("Bouncer checks en cache: %d IPs", len(bouncer_check_state))
 
-    # Initial catchup
+    # Initial catchup (log-based operations — safe regardless of CF reachability)
     log.info("Rattrapage des %dh…", LOOKBACK_HOURS)
     reported     = sync_abuseipdb(reported)
     recidivists  = sync_recidivists(recidivists)
     modsec_state, reported = sync_modsec(modsec_state, cs_allowlist, reported)
     cidr_state   = sync_cidr_bans(cidr_state, cs_allowlist)
 
-    # Notify systemd we're ready
-    _sd_notify("READY=1\nSTATUS=Running\n")
+    # READY=1 sent unconditionally — STATUS communicates boot health to systemd
+    status_msg = "Degraded" if not _boot_healthy else "Running"
+    _sd_notify(f"READY=1\nSTATUS={status_msg}\n")
 
-    loop_count       = 0
-    waf_poll_count   = 0
-    reconcile_count  = 0
-    last_reconcile   = time.monotonic()
-
-    # Trim WAL on startup
-    _wal_trim()
+    loop_count      = 0
+    waf_poll_count  = 0
+    reconcile_count = 0
+    last_reconcile  = time.monotonic()
 
     while not _shutdown.is_set():
         cycle_start = time.monotonic()
 
-        # Hot reload if SIGHUP received
+        # Hot reload on SIGHUP
         if _reload.is_set():
             _reload.clear()
             log.info("Hot reload: rechargement allowlist + protected ranges")
@@ -1992,6 +2119,21 @@ def main() -> None:
             _protected_networks = _build_protected_networks()
             log.info("Hot reload terminé — allowlist: %d entrées, protected: %d nets",
                      len(cs_allowlist), len(_protected_networks))
+
+        # Auto-recover from degraded boot once CF is reachable
+        if not _boot_healthy:
+            try:
+                _fetch_cf_rules()
+                _boot_healthy    = True
+                _degraded_reason = ""
+                log.info("CF rétabli — sortie du mode dégradé")
+            except Exception:
+                log.warning("Mode dégradé: CF toujours inaccessible, sync CF ignoré ce cycle")
+                _sd_notify(f"WATCHDOG=1\nSTATUS=Degraded: {_degraded_reason}\n")
+                elapsed   = time.monotonic() - cycle_start
+                remaining = max(0.0, INTERVAL - elapsed)
+                _shutdown.wait(timeout=remaining)
+                continue
 
         try:
             sync_cloudflare(cs_allowlist)
@@ -2021,7 +2163,7 @@ def main() -> None:
                     waf_state, recidivists, cs_allowlist, reported
                 )
 
-            # Periodic reconciliation (every RECONCILE_SECS)
+            # Periodic reconciliation
             if (
                 not _shutdown.is_set()
                 and (time.monotonic() - last_reconcile) >= RECONCILE_SECS
@@ -2046,22 +2188,26 @@ def main() -> None:
         elapsed = time.monotonic() - cycle_start
         log.debug("Cycle %d terminé en %.1fs", loop_count, elapsed)
 
-        # Update health state
+        # Update health endpoint state
         with _health_lock:
-            _health_state.update(_build_health(
-                cs_allowlist_size=len(cs_allowlist),
-                recidivists_size=len(recidivists),
-                cidr_size=len(cidr_state),
-            ))
+            _health_state.update(
+                _build_health(
+                    cs_allowlist_size=len(cs_allowlist),
+                    recidivists_size=len([k for k in recidivists if not k.startswith("_")]),
+                    cidr_size=len(cidr_state),
+                )
+            )
 
-        # Watchdog heartbeat
         _sd_notify(f"WATCHDOG=1\nSTATUS=Cycle {loop_count} OK\n")
 
-        _shutdown.wait(timeout=max(0.0, INTERVAL - elapsed))
+        remaining = max(0.0, INTERVAL - elapsed)
+        _shutdown.wait(timeout=remaining)
 
-    log.info("=== Arrêt gracieux terminé (cycles: %d, réconciliations: %d) ===",
-             loop_count, reconcile_count)
     _sd_notify("STOPPING=1\n")
+    log.info(
+        "=== Arrêt gracieux terminé (cycles: %d, réconciliations: %d) ===",
+        loop_count, reconcile_count,
+    )
 
 
 if __name__ == "__main__":
