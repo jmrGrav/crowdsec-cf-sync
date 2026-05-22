@@ -2553,13 +2553,13 @@ def cmd_doctor() -> int:
     else:
         try:
             result = subprocess.run(
-                ["cscli", "decisions", "list", "--no-header", "-o", "raw"],
+                ["cscli", "lapi", "status"],
                 capture_output=True, text=True, timeout=10,
             )
             if result.returncode == 0:
                 chk_ok("CrowdSec LAPI reachable")
             else:
-                chk_fail("CrowdSec LAPI error", result.stderr.strip()[:80])
+                chk_fail("CrowdSec LAPI error", (result.stderr or result.stdout).strip()[:80])
         except FileNotFoundError:
             chk_warn("cscli not found in PATH")
         except Exception as e:

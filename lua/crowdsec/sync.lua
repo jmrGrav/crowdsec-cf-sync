@@ -48,7 +48,14 @@ end
 local function load_sync_file()
     local t0 = ngx.now()
 
-    -- ── Memory guard: hard-stop if dict dangerously full (< DICT_MIN_FREE) ─────
+    -- ── Dict saturation policy ────────────────────────────────────────────────
+    --   Level 1 HEALTHY  : free_pct >= 10%    — normal operation
+    --   Level 2 PRESSURE : free_pct < 10%     — suppress heuristic writes;
+    --                                           existing verdicts preserved;
+    --                                           set memory_pressure=1 flag
+    --   Level 3 CRITICAL : free_bytes < 2 MB  — skip dict load entirely;
+    --                                           no new verdicts; log WARN
+    -- Thresholds: DICT_MIN_FREE=2MB (init.lua), MEM_PRESSURE_PCT=90% (init.lua)
     local cache = cs.cache
     local free_before = cache:free_space() or 0
     if free_before < cs.DICT_MIN_FREE then
@@ -147,6 +154,18 @@ local function load_sync_file()
     local metrics = cs.metrics
     local state   = cs.state
 
+    -- ── Field type validation ──────────────────────────────────────────────────
+    -- Explicit type checks at the trust boundary. data comes from an external
+    -- file; malformed fields would silently produce wrong verdicts if accepted.
+    if type(data.bans)  ~= "table" and data.bans  ~= nil then
+        ngx.log(ngx.WARN, "[crowdsec:sync] component=sync event=field_type_error field=bans")
+        return
+    end
+    if type(data.cidrs) ~= "table" and data.cidrs ~= nil then
+        ngx.log(ngx.WARN, "[crowdsec:sync] component=sync event=field_type_error field=cidrs")
+        return
+    end
+
     local bans  = data.bans  or {}
     local cidrs = data.cidrs or {}
 
@@ -176,9 +195,10 @@ local function load_sync_file()
 
     -- ── Individual IP bans ────────────────────────────────────────────────────
     for ip, info in pairs(bans) do
-        local score  = tonumber(info.score)  or 100
-        local level  = tonumber(info.level)  or cs.score_to_level(score)
-        local ttl    = tonumber(info.ttl)    or 3600
+        if type(info) ~= "table" then goto continue_bans end  -- skip malformed entry
+        local score  = math.max(0, math.min(100000, tonumber(info.score)  or 100))
+        local level  = math.max(0, math.min(cs.LEVEL_DENY, tonumber(info.level) or cs.score_to_level(score)))
+        local ttl    = math.max(1, math.min(86400 * 7, tonumber(info.ttl) or 3600))
 
         -- Don't downgrade an IP that heuristics escalated beyond Python's level
         local existing = cs.decode_verdict(cache:get("ip:" .. ip))
@@ -190,13 +210,15 @@ local function load_sync_file()
             end
         end
         loaded = loaded + 1
+        ::continue_bans::
     end
 
     -- ── CIDR bans ─────────────────────────────────────────────────────────────
     for cidr, info in pairs(cidrs) do
-        local score = tonumber(info.score) or 100
-        local level = tonumber(info.level) or 5
-        local ttl   = tonumber(info.ttl)   or 86400
+        if type(info) ~= "table" then goto continue_cidrs end
+        local score = math.max(0, math.min(100000, tonumber(info.score) or 100))
+        local level = math.max(0, math.min(cs.LEVEL_DENY, tonumber(info.level) or 5))
+        local ttl   = math.max(1, math.min(86400 * 30, tonumber(info.ttl) or 86400))
         local val   = level .. ":" .. score .. ":p"
 
         local p24 = prefix24(cidr)
@@ -212,6 +234,7 @@ local function load_sync_file()
                 loaded = loaded + 1
             end
         end
+        ::continue_cidrs::
     end
 
     -- ── Update sync metadata ──────────────────────────────────────────────────

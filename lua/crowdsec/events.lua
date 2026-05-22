@@ -7,6 +7,11 @@
   All writes are deferred via ngx.timer.at(0, ...) so the request
   context is never blocked by I/O, even if the disk is slow.
 
+  Flood protection (per-IP dedup):
+    Key "evt:<ip>:<type>" in crowdsec_state dict with TTL=EVENT_COOLDOWN_SECS.
+    If the key exists, the event is silently dropped (already written recently).
+    This prevents a single IP from flooding the events.jsonl file.
+
   Size guard: if the file exceeds EVENTS_MAX_BYTES, the event is dropped
   and a counter is incremented. This happens only when Python is stopped;
   in normal operation Python drains the file every 60s.
@@ -20,7 +25,20 @@ local M    = {}
 local cjson = require "cjson.safe"
 local cs    = require "crowdsec.init"
 
+-- EVENT_COOLDOWN_SECS: minimum gap between writing the same event type
+-- for the same IP. Prevents a single IP from flooding events.jsonl.
+local EVENT_COOLDOWN_SECS = 60
+
 function M.write(event_type, ip, score, detail)
+    -- ── Per-IP dedup: skip if we recently wrote this event type for this IP ────
+    local dedup_key = "evt:" .. ip .. ":" .. event_type
+    local already, _ = cs.state:get(dedup_key)
+    if already then
+        return  -- silently drop — event already recorded within cooldown window
+    end
+    -- Reserve the slot before the async write so concurrent workers don't race
+    cs.state:set(dedup_key, 1, EVENT_COOLDOWN_SECS)
+
     local entry = {
         ts     = ngx.now(),
         type   = event_type,
