@@ -37,22 +37,32 @@ function M.get_verdict(ip)
 
     -- 1. Exact IP
     local v = cs.decode_verdict(cache:get("ip:" .. ip))
-    if v then return v end
+    if v then
+        cs.metrics:incr("cache_hits", 1, 0)
+        return v
+    end
 
     -- 2. /24 CIDR
     local p24 = prefix24(ip)
     if p24 then
         v = cs.decode_verdict(cache:get("cidr24:" .. p24))
-        if v then return v end
+        if v then
+            cs.metrics:incr("cache_hits", 1, 0)
+            return v
+        end
     end
 
     -- 3. /16 CIDR
     local p16 = prefix16(ip)
     if p16 then
         v = cs.decode_verdict(cache:get("cidr16:" .. p16))
-        if v then return v end
+        if v then
+            cs.metrics:incr("cache_hits", 1, 0)
+            return v
+        end
     end
 
+    cs.metrics:incr("cache_misses", 1, 0)
     return nil
 end
 

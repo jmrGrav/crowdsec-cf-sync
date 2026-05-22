@@ -48,7 +48,7 @@ end
 local function load_sync_file()
     local t0 = ngx.now()
 
-    -- ── Memory guard: refuse to load if dict is dangerously full ─────────────
+    -- ── Memory guard: hard-stop if dict dangerously full (< DICT_MIN_FREE) ─────
     local cache = cs.cache
     local free_before = cache:free_space() or 0
     if free_before < cs.DICT_MIN_FREE then
@@ -57,6 +57,26 @@ local function load_sync_file()
             " free_bytes=", free_before,
             " threshold=", cs.DICT_MIN_FREE)
         return
+    end
+
+    -- ── Memory pressure: soft-stop at MEM_PRESSURE_PCT% full ─────────────────
+    -- Set a flag in state dict that access.lua reads to suppress heuristic writes.
+    -- Suppressing new writes keeps the dict stable during sustained pressure.
+    -- Rate-limit WARN to once per 60s to avoid log spam.
+    local free_pct = (free_before / cs.CSCF_VERDICTS_SIZE) * 100
+    local is_pressure = free_pct < (100 - cs.MEM_PRESSURE_PCT)
+    cs.state:set("memory_pressure", is_pressure and 1 or 0, cs.SYNC_INTERVAL * 6)
+    if is_pressure then
+        cs.metrics:incr("memory_pressure_events", 1, 0)
+        local last_warn = cs.state:get("mem_pressure_warn_ts") or 0
+        if (ngx.time() - last_warn) > 60 then
+            ngx.log(ngx.WARN,
+                "[crowdsec:sync] component=sync event=memory_pressure",
+                " free_bytes=", free_before,
+                " free_pct=", string.format("%.1f", free_pct),
+                " threshold_pct=", 100 - cs.MEM_PRESSURE_PCT)
+            cs.state:set("mem_pressure_warn_ts", ngx.time(), 300)
+        end
     end
 
     local f, ferr = io.open(cs.SYNC_FILE, "r")
@@ -95,6 +115,34 @@ local function load_sync_file()
     -- ── Sequence guard: ignore stale or replayed files ────────────────────────
     local ver = tonumber(data.version) or 0
     if ver <= last_version then return end
+
+    -- ── Timestamp validation: reject stale or future-dated files ─────────────
+    -- Python writes updated_at_epoch (Unix seconds) alongside the ISO string.
+    -- Stale files indicate a snapshot restore or paused Python daemon.
+    -- Future-dated files indicate severe clock skew on the Python side.
+    local uat = tonumber(data.updated_at_epoch)
+    if uat then
+        local now = ngx.time()
+        local age = now - uat
+        if age > cs.BANS_STALE_SECS then
+            ngx.log(ngx.WARN,
+                "[crowdsec:sync] component=sync event=ipc_stale_file",
+                " age_secs=", age,
+                " limit=", cs.BANS_STALE_SECS,
+                " version=", ver)
+            cs.metrics:incr("ipc_rejected", 1, 0)
+            return
+        end
+        if (uat - now) > cs.BANS_FUTURE_SECS then
+            ngx.log(ngx.WARN,
+                "[crowdsec:sync] component=sync event=ipc_future_timestamp",
+                " delta_secs=", uat - now,
+                " limit=", cs.BANS_FUTURE_SECS,
+                " version=", ver)
+            cs.metrics:incr("ipc_rejected", 1, 0)
+            return
+        end
+    end
 
     local metrics = cs.metrics
     local state   = cs.state
@@ -186,6 +234,24 @@ local function load_sync_file()
     if free_after then metrics:set("cache_free_bytes", free_after) end
 
     local dt_ms = math.floor((ngx.now() - t0) * 1000)
+    metrics:set("sync_duration_ms", dt_ms)
+
+    -- ── Python daemon meta counters ───────────────────────────────────────────
+    -- Python writes a "meta" section with its own operational counters.
+    -- Store them in the metrics dict so they appear in /crowdsec-status and
+    -- /crowdsec-metrics without requiring a separate HTTP call to port 8765.
+    local meta = data.meta
+    if meta then
+        if meta.cycle_count     then metrics:set("py_cycle_count",    tonumber(meta.cycle_count)    or 0) end
+        if meta.cf_api_errors   then metrics:set("py_cf_api_errors",  tonumber(meta.cf_api_errors)  or 0) end
+        if meta.wal_entries     then metrics:set("py_wal_entries",    tonumber(meta.wal_entries)    or 0) end
+        if meta.lua_sync_errors then metrics:set("py_lua_sync_errors",tonumber(meta.lua_sync_errors)or 0) end
+        -- degraded: store as 1/0 for Prometheus compatibility
+        if meta.degraded ~= nil then
+            metrics:set("py_degraded", meta.degraded and 1 or 0)
+        end
+    end
+
     local log_level = evicted > 0 and ngx.WARN or ngx.INFO
     ngx.log(log_level,
         "[crowdsec:sync] component=sync event=reload",

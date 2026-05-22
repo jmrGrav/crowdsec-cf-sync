@@ -2121,14 +2121,27 @@ def push_lua_state(
             cidrs[cidr] = {"score": 100, "level": 5, "ttl": 86400, "reason": "crowdsec-cidr"}
 
         # Build payload without crc32 first, then compute and inject
+        now_utc = datetime.now(timezone.utc)
+        m = metrics.snapshot()
         payload: dict = {
-            "version":         _lua_sync_version,
-            "updated_at":      datetime.now(timezone.utc).isoformat(),
-            "entry_count":     len(bans) + len(cidrs),
-            "writer_pid":      os.getpid(),
-            "writer_hostname": socket.gethostname(),
-            "bans":            bans,
-            "cidrs":           cidrs,
+            "version":           _lua_sync_version,
+            "updated_at":        now_utc.isoformat(),
+            "updated_at_epoch":  int(now_utc.timestamp()),
+            "entry_count":       len(bans) + len(cidrs),
+            "writer_pid":        os.getpid(),
+            "writer_hostname":   socket.gethostname(),
+            "bans":              bans,
+            "cidrs":             cidrs,
+            # Python daemon operational counters — Lua reads these and stores in
+            # crowdsec_metrics dict, making them visible at /crowdsec-status and
+            # /crowdsec-metrics without requiring a separate call to port 8765.
+            "meta": {
+                "cycle_count":     m.get("cycle_count", 0),
+                "cf_api_errors":   m.get("cf_api_errors", 0),
+                "wal_entries":     m.get("wal_entries", 0),
+                "lua_sync_errors": m.get("lua_sync_errors", 0),
+                "degraded":        not _boot_healthy or bool(_degraded_reason),
+            },
         }
         # Compute crc32 of the payload-so-far for integrity verification
         pre_content = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()

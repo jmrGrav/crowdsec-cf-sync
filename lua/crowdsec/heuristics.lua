@@ -120,17 +120,24 @@ end
 -- Score a request and accumulate in shared dict.
 -- Returns delta score (for this request only; not cumulative).
 function M.score_request(ip, uri, method, hdrs)
-    local delta = 0
-
-    delta = delta + score_ua(hdrs["user-agent"])
-    delta = delta + score_headers(hdrs)
-    delta = delta + score_path(uri)
+    local ua_score   = score_ua(hdrs["user-agent"])
+    local hdr_score  = score_headers(hdrs)
+    local path_score = score_path(uri)
 
     -- Burst detection: too many requests from same IP in BURST_WINDOW
     local burst = lookup.incr_burst(ip)
+    local burst_score = 0
     if burst > cs.BURST_THRESHOLD then
-        delta = delta + math.min(25, math.floor((burst - cs.BURST_THRESHOLD) / 10))
+        burst_score = math.min(25, math.floor((burst - cs.BURST_THRESHOLD) / 10))
+        cs.metrics:incr("burst_hits", 1, 0)
     end
+
+    -- Per-signal counters for observability (only when signal contributed)
+    if ua_score   > 0 then cs.metrics:incr("ua_hits",            1, 0) end
+    if hdr_score  > 0 then cs.metrics:incr("header_anomaly_hits", 1, 0) end
+    if path_score > 0 then cs.metrics:incr("path_hits",          1, 0) end
+
+    local delta = ua_score + hdr_score + path_score + burst_score
 
     if delta <= 0 then return 0 end
 

@@ -38,10 +38,24 @@ M.FAIL_OPEN = true
 --   attempting JSON parse (prevents memory spike from corrupted/injected files).
 -- EVENTS_MAX_BYTES: refuse to append to events.jsonl beyond this size.
 --   Python consumes the file atomically; unbounded growth means Python is down.
-M.DEADMAN_SECS       = 120           -- 2 min without sync → stale mode
-M.DICT_MIN_FREE      = 2097152       -- 2 MB: stop loading new entries below this
+-- BANS_STALE_SECS: reject bans.json whose updated_at_epoch is older than this.
+--   Protects against replayed or stale files (e.g. filesystem snapshot restores).
+-- BANS_FUTURE_SECS: reject bans.json whose updated_at_epoch is this far ahead
+--   of wall-clock — clock skew guard.
+-- CSCF_VERDICTS_SIZE: declared size of the cscf_verdicts shared dict in bytes.
+--   Must match lua_shared_dict cscf_verdicts Nm in crowdsec_shared_dicts.conf.
+--   Used only for soft-pressure percentage calculation; not a hard API value.
+-- MEM_PRESSURE_PCT: when cscf_verdicts is fuller than this %, suppress new
+--   heuristic writes (dict reads and existing verdict lookups still work).
+--   Soft layer before DICT_MIN_FREE hard-stop.
+M.DEADMAN_SECS        = 120          -- 2 min without sync → stale mode
+M.DICT_MIN_FREE       = 2097152      -- 2 MB: hard stop — no new entries below this
 M.BANS_JSON_MAX_BYTES = 10485760     -- 10 MB: reject oversized bans.json
 M.EVENTS_MAX_BYTES    = 1048576      -- 1 MB: stop appending events.jsonl beyond this
+M.BANS_STALE_SECS     = 600          -- 10 min: reject bans.json older than this
+M.BANS_FUTURE_SECS    = 300          -- 5 min: reject bans.json with future timestamp
+M.CSCF_VERDICTS_SIZE  = 52428800     -- 50 MB: must match lua_shared_dict cscf_verdicts
+M.MEM_PRESSURE_PCT    = 90           -- % full: suspend heuristic writes above this
 
 -- ── Mitigation levels ─────────────────────────────────────────────────────────
 M.LEVEL_ALLOW     = 0

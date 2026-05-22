@@ -40,6 +40,8 @@ function M.check()
         local ip = ngx.var.remote_addr
         if not ip or ip == "" then return end
 
+        cs.metrics:incr("total_checks", 1, 0)
+
         local uri    = ngx.var.request_uri or "/"
         local method = ngx.req.get_method()
 
@@ -52,23 +54,27 @@ function M.check()
             return
         end
 
-        -- ── 2. Deadman check ──────────────────────────────────────────────────
+        -- ── 2. Deadman + memory pressure checks ──────────────────────────────
         local stale = sync_is_stale()
         if stale then
             cs.metrics:incr("sync_stale_checks", 1, 0)
         end
+        -- memory_pressure: set by sync.lua when cscf_verdicts > MEM_PRESSURE_PCT% full.
+        -- Suppresses new heuristic writes to the dict while preserving existing verdicts.
+        local mem_pressure = cs.state:get("memory_pressure") == 1
 
         -- ── 3. Verdict lookup (Python-pushed bans) ────────────────────────────
         local verdict = lookup.get_verdict(ip)
         if verdict and verdict.level >= cs.LEVEL_DENY then
-            -- Hard deny always applies, even in stale mode
+            -- Hard deny always applies, even in stale or pressure mode
             mitigation.apply(verdict, ip)
             return
         end
 
-        -- ── 4. Local heuristics (suspended in stale mode) ────────────────────
-        -- Skip when sync is stale to avoid false-positives from outdated scoring.
-        if not stale then
+        -- ── 4. Local heuristics (suspended when stale or under memory pressure) ──
+        -- Skip when stale: avoids false-positives from outdated scoring.
+        -- Skip when memory pressure: avoids writing new entries to a nearly-full dict.
+        if not stale and not mem_pressure then
             local hdrs = ngx.req.get_headers(50, true)
             local delta = heuristics.score_request(ip, uri, method, hdrs)
 
