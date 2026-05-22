@@ -54,7 +54,7 @@ detect_endpoints
 # ── State management ──────────────────────────────────────────────────────────
 SYNC_BACKUP=""
 SYNC_INTERVAL=7   # SYNC_INTERVAL=5s + 2s margin
-ERRORS=0; TOTAL=0
+ERRORS=0; TOTAL=0; SKIPPED=0
 TARGET_TEST="${1:-}"  # e.g. --test stale
 
 backup_sync_file() {
@@ -178,23 +178,23 @@ RUN_TEST() {
 echo "── Test 1: Stale timestamp rejection ───────────────────────────────────"
 
 rejected_before=$(get_counter ".ipc.rejected_total")
-ver_before=$(get_counter ".sync.version")
 
 STALE_EPOCH=$(( $(date +%s) - 700 ))   # 700s ago > BANS_STALE_SECS=600
-NEW_VER=$(( CURRENT_VERSION + 100 ))
+NEW_VER=$(( CURRENT_VERSION + 1 ))
 write_valid_bans_json "$NEW_VER" "$STALE_EPOCH"
 
 sleep $SYNC_INTERVAL
 
 rejected_after=$(get_counter ".ipc.rejected_total")
-ver_after=$(get_counter ".sync.version")
 
 assert_counter_increased "ipc_rejected incremented on stale timestamp" \
     "$rejected_before" "$rejected_after"
-assert_counter_unchanged "sync version did not advance past stale file" \
-    "$ver_before" "$ver_after"
+# sync version may advance concurrently (Python's own valid push) — not asserted here
 
 restore_sync_file; backup_sync_file
+# Refresh CURRENT_VERSION: Python may have pushed during the sleep, advancing last_version.
+# Test 2 must inject a version higher than the current last_version.
+CURRENT_VERSION=$(get_counter ".sync.version")
 sleep 2
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -205,39 +205,64 @@ echo ""
 echo "── Test 2: Future timestamp rejection ──────────────────────────────────"
 
 rejected_before=$(get_counter ".ipc.rejected_total")
-ver_before=$(get_counter ".sync.version")
 
 FUTURE_EPOCH=$(( $(date +%s) + 400 ))  # 400s in future > BANS_FUTURE_SECS=300
-NEW_VER=$(( CURRENT_VERSION + 200 ))
+NEW_VER=$(( CURRENT_VERSION + 1 ))
 write_valid_bans_json "$NEW_VER" "$FUTURE_EPOCH"
 
 sleep $SYNC_INTERVAL
 
 rejected_after=$(get_counter ".ipc.rejected_total")
-ver_after=$(get_counter ".sync.version")
 
 assert_counter_increased "ipc_rejected incremented on future timestamp" \
     "$rejected_before" "$rejected_after"
-assert_counter_unchanged "sync version did not advance past future file" \
-    "$ver_before" "$ver_after"
+# sync version may advance concurrently (Python's own valid push) — not asserted here
 
 restore_sync_file; backup_sync_file
+CURRENT_VERSION=$(get_counter ".sync.version")
 sleep 2
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TEST 3 — Events.jsonl flood: write > EVENTS_MAX_BYTES (1 MB) then append one more
-# Expected: dropped_events counter increments
+# TEST 3 — Events.jsonl flood: fill events.jsonl beyond EVENTS_MAX_BYTES,
+#           then trigger events.write() via an actual honeypot HTTPS request.
+# Expected: dropped_events counter increments.
+#
+# events.write() is only called during request processing (access.lua or
+# heuristics.lua), NOT during bans.json loading. This test auto-detects a
+# CrowdSec-protected vhost and uses `curl -k --resolve` to bypass DNS.
 # ─────────────────────────────────────────────────────────────────────────────
 echo ""
 echo "── Test 3: events.jsonl flood → dropped_events ─────────────────────────"
 
+# Auto-detect a CrowdSec-protected HTTPS vhost (one that includes crowdsec_access).
+# Store dump first — piping into "python3 - <<'HEREDOC'" causes the heredoc to shadow
+# stdin, leaving sys.stdin.read() empty. Use -c with a stored variable instead.
+_NGINX_DUMP=$(sudo openresty -T 2>/dev/null)
+LUA_VHOST=$(echo "$_NGINX_DUMP" | python3 -c "
+import re, sys
+content = sys.stdin.read()
+matches = re.findall(
+    r'server_name\s+([\w.\-]+)\s*;.*?include\s+snippets/crowdsec_access\.conf',
+    content, re.DOTALL)
+# Exclude wildcard _ placeholder
+real = [m for m in matches if m != '_']
+print(real[0] if real else '')
+")
+
 dropped_before=$(get_counter ".ipc.dropped_events")
+honeypot_before=$(get_counter ".heuristics.honeypot_hits")
 
-# Backup existing events file if present
-[ -f "$EVENTS_FILE" ] && cp "$EVENTS_FILE" "${EVENTS_FILE}.chaos_backup"
+if [ -z "$LUA_VHOST" ]; then
+    info "SKIP: no CrowdSec-protected HTTPS vhost detected in openresty -T"
+    SKIPPED=$((SKIPPED+1))
+else
+    info "Detected Lua-protected vhost: $LUA_VHOST"
 
-# Write a 1.1 MB events file (beyond the 1 MB limit)
-python3 - "$EVENTS_FILE" <<'PYEOF'
+    # Backup existing events file if present
+    [ -f "$EVENTS_FILE" ] && sudo cp "$EVENTS_FILE" "${EVENTS_FILE}.chaos_backup"
+
+    # Fill events.jsonl to 1.1 MB (beyond EVENTS_MAX_BYTES=1MB)
+    sudo python3 - "$EVENTS_FILE" <<'PYEOF'
 import json, os, sys
 dest = sys.argv[1]
 line = json.dumps({"ts": 1.0, "type": "chaos_flood", "ip": "1.2.3.4",
@@ -248,24 +273,39 @@ with open(dest, "w") as f:
     while written < 1_150_000:   # 1.1 MB > EVENTS_MAX_BYTES
         f.write(line)
         written += len(line)
+print(f"events.jsonl: {os.path.getsize(dest)//1024} KB written")
 PYEOF
 
-# Wait for a Lua timer tick; the next event.write() should see the oversized file
-# We trigger it by injecting a valid bans.json that causes an escalation event
-NOW_EPOCH=$(date +%s)
-write_valid_bans_json "$(( CURRENT_VERSION + 300 ))" "$NOW_EPOCH" "5.5.5.5"
-sleep $SYNC_INTERVAL
+    # Trigger events.write() via honeypot path on a CrowdSec-protected HTTPS vhost.
+    # --resolve bypasses DNS so we hit 127.0.0.1 directly. -k skips TLS cert check.
+    curl -k -s -m 5 -o /dev/null \
+        --resolve "${LUA_VHOST}:443:127.0.0.1" \
+        "https://${LUA_VHOST}/.env" 2>/dev/null || true
+    sleep 1
+    curl -k -s -m 5 -o /dev/null \
+        --resolve "${LUA_VHOST}:443:127.0.0.1" \
+        "https://${LUA_VHOST}/.env" 2>/dev/null || true
+    sleep 2
 
-dropped_after=$(get_counter ".ipc.dropped_events")
+    dropped_after=$(get_counter ".ipc.dropped_events")
+    honeypot_after=$(get_counter ".heuristics.honeypot_hits")
 
-assert_counter_increased "dropped_events incremented after events flood" \
-    "$dropped_before" "$dropped_after"
+    TOTAL=$((TOTAL+1))
+    if [ "$honeypot_after" -gt "$honeypot_before" ] 2>/dev/null; then
+        info "honeypot_hits: $honeypot_before → $honeypot_after (events.write was called)"
+        assert_counter_increased "dropped_events incremented after events flood" \
+            "$dropped_before" "$dropped_after"
+    else
+        fail "events.write not triggered (honeypot_hits unchanged: ${honeypot_before})"
+        info "  Try: curl -k --resolve ${LUA_VHOST}:443:127.0.0.1 https://${LUA_VHOST}/.env"
+    fi
 
-# Restore events file
-if [ -f "${EVENTS_FILE}.chaos_backup" ]; then
-    mv "${EVENTS_FILE}.chaos_backup" "$EVENTS_FILE"
-else
-    rm -f "$EVENTS_FILE"
+    # Restore events file
+    if [ -f "${EVENTS_FILE}.chaos_backup" ]; then
+        sudo mv "${EVENTS_FILE}.chaos_backup" "$EVENTS_FILE"
+    else
+        sudo rm -f "$EVENTS_FILE"
+    fi
 fi
 
 restore_sync_file; backup_sync_file
@@ -279,8 +319,11 @@ echo ""
 echo "── Test 4: Python meta section → Lua metrics ───────────────────────────"
 
 TOTAL=$((TOTAL+1))
+# Use CURRENT_VERSION + 1 so that after restore (CURRENT_VERSION),
+# Python's next push (CURRENT_VERSION+2) is accepted normally.
+# Using large offsets raises last_version and blocks Python for hundreds of cycles.
 NOW_EPOCH=$(date +%s)
-NEW_VER=$(( CURRENT_VERSION + 400 ))
+NEW_VER=$(( CURRENT_VERSION + 1 ))
 
 python3 - "$SYNC_FILE" "$NEW_VER" "$NOW_EPOCH" <<'PYEOF'
 import json, os, sys, tempfile
@@ -356,7 +399,7 @@ fi
 # ── Final report ──────────────────────────────────────────────────────────────
 echo ""
 echo "══════════════════════════════════════════════════════════════════════════"
-echo " Results: $((TOTAL - ERRORS))/${TOTAL} passed"
+echo " Results: $((TOTAL - ERRORS))/${TOTAL} passed  (${SKIPPED} skipped)"
 [ "$ERRORS" -gt 0 ] && echo -e " ${RED}${ERRORS} test(s) FAILED${RESET}"
 echo "══════════════════════════════════════════════════════════════════════════"
 
