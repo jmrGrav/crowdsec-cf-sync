@@ -34,8 +34,14 @@ M.FAIL_OPEN = true
 --   only level-5 deny verdicts remain active (fail-open for grey zones).
 -- DICT_MIN_FREE: refuse to write new verdicts to the cache dict if free space
 --   falls below this threshold, preventing OOM eviction of live entries.
-M.DEADMAN_SECS  = 120     -- 2 minutes without a successful sync → stale mode
-M.DICT_MIN_FREE = 2097152 -- 2 MB guard: stop accepting new entries below this
+-- BANS_JSON_MAX_BYTES: reject bans.json payloads larger than this before
+--   attempting JSON parse (prevents memory spike from corrupted/injected files).
+-- EVENTS_MAX_BYTES: refuse to append to events.jsonl beyond this size.
+--   Python consumes the file atomically; unbounded growth means Python is down.
+M.DEADMAN_SECS       = 120           -- 2 min without sync → stale mode
+M.DICT_MIN_FREE      = 2097152       -- 2 MB: stop loading new entries below this
+M.BANS_JSON_MAX_BYTES = 10485760     -- 10 MB: reject oversized bans.json
+M.EVENTS_MAX_BYTES    = 1048576      -- 1 MB: stop appending events.jsonl beyond this
 
 -- ── Mitigation levels ─────────────────────────────────────────────────────────
 M.LEVEL_ALLOW     = 0

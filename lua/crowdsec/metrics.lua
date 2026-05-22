@@ -42,26 +42,31 @@ function M.handle()
         },
         -- Counters
         counters = {
-            lua_syncs         = g("lua_syncs"),
-            lua_cache_entries = g("lua_cache_entries"),
-            cache_free_bytes  = g("cache_free_bytes"),
-            heuristic_hits    = g("heuristic_hits"),
-            honeypot_hits     = g("honeypot_hits"),
-            escalations       = g("escalations"),
-            tarpit_total      = g("tarpit_total"),
-            tarpit_skipped    = g("tarpit_skipped"),
-            tarpits           = g("tarpits"),
-            denies            = g("denies"),
-            challenges        = g("challenges"),
-            captchas          = g("captchas"),
-            ratelimit_drops   = g("ratelimit_drops"),
+            lua_syncs           = g("lua_syncs"),
+            lua_cache_entries   = g("lua_cache_entries"),
+            cache_free_bytes    = g("cache_free_bytes"),
+            heuristic_hits      = g("heuristic_hits"),
+            honeypot_hits       = g("honeypot_hits"),
+            escalations         = g("escalations"),
+            tarpit_total        = g("tarpit_total"),
+            tarpit_skipped      = g("tarpit_skipped"),
+            tarpits             = g("tarpits"),
+            denies              = g("denies"),
+            challenges          = g("challenges"),
+            captchas            = g("captchas"),
+            ratelimit_drops     = g("ratelimit_drops"),
+            sync_stale_checks   = g("sync_stale_checks"),
+            -- IPC integrity
+            ipc_rejected        = g("ipc_rejected"),
+            dict_set_failures   = g("dict_set_failures"),
+            dropped_events      = g("dropped_events"),
             -- Per-level
-            level_0_hits      = g("level_0_hits"),
-            level_1_hits      = g("level_1_hits"),
-            level_2_hits      = g("level_2_hits"),
-            level_3_hits      = g("level_3_hits"),
-            level_4_hits      = g("level_4_hits"),
-            level_5_hits      = g("level_5_hits"),
+            level_0_hits        = g("level_0_hits"),
+            level_1_hits        = g("level_1_hits"),
+            level_2_hits        = g("level_2_hits"),
+            level_3_hits        = g("level_3_hits"),
+            level_4_hits        = g("level_4_hits"),
+            level_5_hits        = g("level_5_hits"),
         },
     }
 
@@ -81,16 +86,20 @@ function M.handle_prometheus()
         table.insert(lines, name .. " " .. tostring(val or 0))
     end
 
-    add("crowdsec_lua_syncs_total",         g("lua_syncs"),         "Total Lua state syncs from Python")
-    add("crowdsec_lua_cache_entries",        g("lua_cache_entries"), "Current entries in Lua verdict cache")
-    add("crowdsec_lua_heuristic_hits_total", g("heuristic_hits"),    "Total heuristic scoring events")
-    add("crowdsec_lua_honeypot_hits_total",  g("honeypot_hits"),     "Total honeypot path hits")
-    add("crowdsec_lua_escalations_total",    g("escalations"),       "Total Lua→Python escalation events")
-    add("crowdsec_lua_tarpit_total",         g("tarpit_total"),      "Total tarpitted requests")
-    add("crowdsec_lua_tarpit_skipped_total", g("tarpit_skipped"),    "Tarpit skipped (concurrency limit)")
-    add("crowdsec_lua_denies_total",         g("denies"),            "Total hard denies (403/444)")
-    add("crowdsec_lua_challenges_total",     g("challenges"),        "Total JS challenge responses")
-    add("crowdsec_lua_ratelimit_drops_total",g("ratelimit_drops"),   "Total rate-limit drops")
+    add("crowdsec_lua_syncs_total",           g("lua_syncs"),           "Total Lua state syncs from Python")
+    add("crowdsec_lua_cache_entries",         g("lua_cache_entries"),   "Current entries in Lua verdict cache")
+    add("crowdsec_lua_heuristic_hits_total",  g("heuristic_hits"),      "Total heuristic scoring events")
+    add("crowdsec_lua_honeypot_hits_total",   g("honeypot_hits"),       "Total honeypot path hits")
+    add("crowdsec_lua_escalations_total",     g("escalations"),         "Total Lua→Python escalation events")
+    add("crowdsec_lua_tarpit_total",          g("tarpit_total"),        "Total tarpitted requests")
+    add("crowdsec_lua_tarpit_skipped_total",  g("tarpit_skipped"),      "Tarpit skipped (concurrency limit)")
+    add("crowdsec_lua_denies_total",          g("denies"),              "Total hard denies (403/444)")
+    add("crowdsec_lua_challenges_total",      g("challenges"),          "Total JS challenge responses")
+    add("crowdsec_lua_ratelimit_drops_total", g("ratelimit_drops"),     "Total rate-limit drops")
+    add("crowdsec_lua_ipc_rejected_total",    g("ipc_rejected"),        "IPC payloads rejected (size/parse/integrity)")
+    add("crowdsec_lua_dict_set_failures",     g("dict_set_failures"),   "Dict set() failures (memory full)")
+    add("crowdsec_lua_dropped_events_total",  g("dropped_events"),      "Events dropped (events.jsonl size limit)")
+    add("crowdsec_lua_sync_stale_checks",     g("sync_stale_checks"),   "Requests processed in stale/deadman mode")
 
     ngx.header["Content-Type"] = "text/plain; version=0.0.4"
     ngx.say(table.concat(lines, "\n") .. "\n")

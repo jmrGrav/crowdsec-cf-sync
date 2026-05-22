@@ -71,9 +71,24 @@ local function load_sync_file()
 
     if not content or content == "" then return end
 
+    -- ── Payload size guard: reject before JSON parse ──────────────────────────
+    -- A corrupted or injected bans.json could be arbitrarily large.
+    -- We check #content (bytes) before allocating a parse tree.
+    if #content > cs.BANS_JSON_MAX_BYTES then
+        ngx.log(ngx.WARN,
+            "[crowdsec:sync] component=sync event=payload_too_large",
+            " size_bytes=", #content,
+            " limit_bytes=", cs.BANS_JSON_MAX_BYTES)
+        cs.metrics:incr("ipc_rejected", 1, 0)
+        return
+    end
+
     local data, perr = cjson.decode(content)
     if not data then
-        ngx.log(ngx.WARN, "[crowdsec:sync] component=sync event=parse_error error=", perr)
+        ngx.log(ngx.WARN,
+            "[crowdsec:sync] component=sync event=parse_error error=", tostring(perr),
+            " size_bytes=", #content)
+        cs.metrics:incr("ipc_rejected", 1, 0)
         return
     end
 
@@ -106,6 +121,7 @@ local function load_sync_file()
     -- Accept this version
     last_version = ver
     local loaded = 0
+    local evicted = 0  -- set() failures due to full dict
 
     -- ── Flush stale dict entries to free memory (periodic) ────────────────────
     cache:flush_expired()
@@ -119,7 +135,11 @@ local function load_sync_file()
         -- Don't downgrade an IP that heuristics escalated beyond Python's level
         local existing = cs.decode_verdict(cache:get("ip:" .. ip))
         if not existing or existing.level <= level then
-            cache:set("ip:" .. ip, level .. ":" .. score .. ":p", ttl)
+            local ok, serr, sforced = cache:set("ip:" .. ip, level .. ":" .. score .. ":p", ttl)
+            if not ok then
+                -- Dict full: set() failed — entry not stored
+                evicted = evicted + 1
+            end
         end
         loaded = loaded + 1
     end
@@ -133,12 +153,14 @@ local function load_sync_file()
 
         local p24 = prefix24(cidr)
         if p24 then
-            cache:set("cidr24:" .. p24, val, ttl)
+            local ok, _ = cache:set("cidr24:" .. p24, val, ttl)
+            if not ok then evicted = evicted + 1 end
             loaded = loaded + 1
         else
             local p16 = prefix16(cidr)
             if p16 then
-                cache:set("cidr16:" .. p16, val, ttl)
+                local ok, _ = cache:set("cidr16:" .. p16, val, ttl)
+                if not ok then evicted = evicted + 1 end
                 loaded = loaded + 1
             end
         end
@@ -151,19 +173,28 @@ local function load_sync_file()
 
     metrics:set("lua_cache_entries", loaded)
     metrics:incr("lua_syncs", 1, 0)
+    if evicted > 0 then
+        metrics:incr("dict_set_failures", evicted, 0)
+        ngx.log(ngx.WARN,
+            "[crowdsec:sync] component=sync event=dict_full",
+            " failed_sets=", evicted,
+            " version=", ver)
+    end
 
     -- Dict health metrics
     local free_after = cache:free_space()
     if free_after then metrics:set("cache_free_bytes", free_after) end
 
     local dt_ms = math.floor((ngx.now() - t0) * 1000)
-    ngx.log(ngx.INFO,
+    local log_level = evicted > 0 and ngx.WARN or ngx.INFO
+    ngx.log(log_level,
         "[crowdsec:sync] component=sync event=reload",
         " version=", ver,
         " entries=", loaded,
+        " failed=", evicted,
         " duration_ms=", dt_ms,
         " free_bytes=", free_after or "?",
-        " status=ok")
+        " status=", evicted > 0 and "partial" or "ok")
 end
 
 -- ── Public init ───────────────────────────────────────────────────────────────
