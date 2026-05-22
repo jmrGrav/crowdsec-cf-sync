@@ -28,6 +28,15 @@ M.BURST_THRESHOLD  = 120  -- requests per BURST_WINDOW before rate-limit kicks i
 -- FAIL_OPEN = false → deny on any lookup error (strict mode)
 M.FAIL_OPEN = true
 
+-- ── Safety thresholds ─────────────────────────────────────────────────────────
+-- DEADMAN_SECS: if sync_ts is older than this, bans.json is considered stale.
+--   In stale mode, aggressive mitigation (tarpit/challenge) is suspended;
+--   only level-5 deny verdicts remain active (fail-open for grey zones).
+-- DICT_MIN_FREE: refuse to write new verdicts to the cache dict if free space
+--   falls below this threshold, preventing OOM eviction of live entries.
+M.DEADMAN_SECS  = 120     -- 2 minutes without a successful sync → stale mode
+M.DICT_MIN_FREE = 2097152 -- 2 MB guard: stop accepting new entries below this
+
 -- ── Mitigation levels ─────────────────────────────────────────────────────────
 M.LEVEL_ALLOW     = 0
 M.LEVEL_RATELIMIT = 1  -- leaky bucket, 429 when exceeded

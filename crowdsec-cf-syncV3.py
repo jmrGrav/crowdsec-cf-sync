@@ -45,9 +45,11 @@ import logging.handlers
 import os
 import random
 import re
+import shutil
 import signal
 import socket
 import subprocess
+import zlib
 import sys
 import tempfile
 import threading
@@ -74,12 +76,22 @@ CF_MIN_CONFIDENCE = os.environ.get("CF_MIN_CONFIDENCE", "low")
 CB_THRESHOLD      = int(os.environ.get("CF_CB_THRESHOLD", "5"))
 CB_RESET_SECS     = float(os.environ.get("CF_CB_RESET_SECS", "120"))
 
-# ── Lua sync (V3.2) ───────────────────────────────────────────────────────────
+# ── Lua sync (V3.2+) ──────────────────────────────────────────────────────────
 # LUA_ENABLED=0 disables Lua push entirely (daemon still syncs CF only).
 LUA_ENABLED    = os.environ.get("LUA_ENABLED", "1").lower() not in ("0", "false", "no")
 LUA_SYNC_DIR   = Path(os.environ.get("LUA_SYNC_DIR", "/run/crowdsec-lua"))
 LUA_SYNC_FILE  = LUA_SYNC_DIR / "bans.json"
 LUA_EVENTS_FILE = LUA_SYNC_DIR / "events.jsonl"
+
+# ── V3.3: auto-heal ───────────────────────────────────────────────────────────
+# If the Lua sync_version stops incrementing for LUA_STALE_SECS, trigger an
+# OpenResty reload (max once per LUA_HEAL_COOLDOWN_SECS).
+LUA_STATUS_URL       = os.environ.get("LUA_STATUS_URL", "http://127.0.0.1:8091/crowdsec-status")
+LUA_STALE_SECS       = int(os.environ.get("LUA_STALE_SECS", "120"))
+LUA_HEAL_COOLDOWN_SECS = int(os.environ.get("LUA_HEAL_COOLDOWN_SECS", "3600"))
+
+# ── V3.3: CF quota warning thresholds ─────────────────────────────────────────
+CF_QUOTA_WARN_PCT  = (70, 85, 95)  # warn at these percentages of CF rule limit
 
 ABUSEIPDB_URL       = "https://api.abuseipdb.com/api/v2/report"
 ABUSEIPDB_CHECK_URL = "https://api.abuseipdb.com/api/v2/check"
@@ -182,6 +194,9 @@ _wal_seq: int  = 0           # monotonic WAL entry counter; initialized from WAL
 _boot_healthy: bool = False  # True after first successful CF API probe
 _degraded_reason: str = ""   # non-empty when in degraded mode
 _lua_sync_version: int = 0   # monotonic version pushed to Lua sync file
+_lua_last_known_version: int = 0   # last sync_version observed from Lua endpoint
+_lua_last_version_change_ts: float = 0.0  # monotonic time of last version change
+_lua_last_heal_ts: float = 0.0            # monotonic time of last auto-heal reload
 
 
 def _handle_signal(signum: int, frame) -> None:
@@ -211,6 +226,17 @@ def _setup_logging() -> logging.Logger:
 
 
 log = _setup_logging()
+
+
+def slog(component: str, event: str, level: int = logging.INFO, **kwargs) -> None:
+    """Emit a structured log line: component=X event=Y key=val ...
+
+    Format mirrors what the Lua layer emits so log aggregators see consistent
+    key=value pairs from both sides of the Python↔Lua boundary.
+    """
+    parts = [f"component={component}", f"event={event}"]
+    parts.extend(f"{k}={v}" for k, v in kwargs.items())
+    log.log(level, " ".join(parts))
 
 
 # ── Metrics ───────────────────────────────────────────────────────────────────
@@ -804,11 +830,17 @@ def _fetch_cf_rules() -> List[dict]:
     )
     raw   = result.get("result", [])
     count = len(raw)
-    if count >= 800:
-        log.warning(
-            "CF quota: %d/1000 règles utilisées — approche de la limite zone", count
-        )
-        metrics.inc("cf_quota_warnings")
+    cf_limit = 1000
+    pct = (count / cf_limit) * 100
+    for threshold in CF_QUOTA_WARN_PCT:
+        if pct >= threshold:
+            slog("cf_quota", "warning",
+                 level=logging.WARNING,
+                 rules=count,
+                 limit=cf_limit,
+                 pct=f"{pct:.0f}")
+            metrics.inc("cf_quota_warnings")
+            break
     return raw
 
 
@@ -2088,15 +2120,20 @@ def push_lua_state(
         for cidr in cidr_state:
             cidrs[cidr] = {"score": 100, "level": 5, "ttl": 86400, "reason": "crowdsec-cidr"}
 
+        # Build payload without crc32 first, then compute and inject
         payload: dict = {
-            "version":     _lua_sync_version,
-            "updated_at":  datetime.now(timezone.utc).isoformat(),
-            "entry_count": len(bans) + len(cidrs),
-            "bans":        bans,
-            "cidrs":       cidrs,
+            "version":         _lua_sync_version,
+            "updated_at":      datetime.now(timezone.utc).isoformat(),
+            "entry_count":     len(bans) + len(cidrs),
+            "writer_pid":      os.getpid(),
+            "writer_hostname": socket.gethostname(),
+            "bans":            bans,
+            "cidrs":           cidrs,
         }
+        # Compute crc32 of the payload-so-far for integrity verification
+        pre_content = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()
+        payload["payload_crc32"] = zlib.crc32(pre_content) & 0xFFFFFFFF
 
-        # Raw JSON write (no versioning envelope — Lua reads it directly)
         content = json.dumps(payload, indent=2, ensure_ascii=False).encode()
         tmp_fd, tmp_path = tempfile.mkstemp(dir=LUA_SYNC_DIR, suffix=".tmp")
         os.fchmod(tmp_fd, 0o644)  # www-data (OpenResty) must be able to read this
@@ -2114,10 +2151,12 @@ def push_lua_state(
             raise
 
         metrics.inc("lua_syncs")
-        log.debug(
-            "Lua sync: %d bans + %d CIDRs (v%d)",
-            len(bans), len(cidrs), _lua_sync_version,
-        )
+        slog("lua_sync", "push",
+             version=_lua_sync_version,
+             bans=len(bans),
+             cidrs=len(cidrs),
+             bytes=len(content),
+             status="ok")
     except Exception as exc:
         metrics.inc("lua_sync_errors")
         log.warning("Lua push échoué (non-fatal): %s", exc)
@@ -2208,6 +2247,424 @@ def process_lua_events(
     return reported
 
 
+# ── Auto-heal ─────────────────────────────────────────────────────────────────
+
+def _query_lua_status() -> Optional[dict]:
+    """Query the local /crowdsec-status endpoint. Returns parsed JSON or None."""
+    try:
+        req = urllib.request.Request(LUA_STATUS_URL, headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return json.loads(resp.read().decode())
+    except Exception:
+        return None
+
+
+def check_lua_autoheal() -> None:
+    """Monitor Lua sync_version. If frozen, reload OpenResty (rate-limited)."""
+    global _lua_last_known_version, _lua_last_version_change_ts, _lua_last_heal_ts
+
+    status = _query_lua_status()
+    if status is None:
+        slog("autoheal", "status_unreachable", level=logging.WARNING,
+             url=LUA_STATUS_URL)
+        return
+
+    version = status.get("sync", {}).get("version", 0)
+    now = time.monotonic()
+
+    if version != _lua_last_known_version:
+        _lua_last_known_version = version
+        _lua_last_version_change_ts = now
+        return  # version is moving, all good
+
+    # Version has not changed — check if it's been frozen too long
+    if _lua_last_version_change_ts == 0.0:
+        _lua_last_version_change_ts = now
+        return
+
+    frozen_secs = now - _lua_last_version_change_ts
+    if frozen_secs < LUA_STALE_SECS:
+        return  # not yet stale
+
+    # Version is frozen — check cooldown before healing
+    if now - _lua_last_heal_ts < LUA_HEAL_COOLDOWN_SECS:
+        slog("autoheal", "cooldown_active", level=logging.WARNING,
+             frozen_secs=round(frozen_secs),
+             cooldown_remaining=round(LUA_HEAL_COOLDOWN_SECS - (now - _lua_last_heal_ts)))
+        return
+
+    # Trigger reload
+    slog("autoheal", "trigger_reload", level=logging.WARNING,
+         reason="sync_version_frozen",
+         frozen_secs=round(frozen_secs),
+         sync_version=version)
+    try:
+        result = subprocess.run(
+            ["systemctl", "reload", "openresty"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0:
+            _lua_last_heal_ts = now
+            _lua_last_version_change_ts = now  # reset frozen clock
+            slog("autoheal", "reload_ok", status="success")
+            metrics.inc("lua_autoheal_reloads")
+        else:
+            slog("autoheal", "reload_failed", level=logging.ERROR,
+                 stderr=result.stderr.strip())
+    except Exception as exc:
+        slog("autoheal", "reload_error", level=logging.ERROR, error=str(exc))
+
+
+# ── WAL tools ─────────────────────────────────────────────────────────────────
+
+def cmd_wal_inspect() -> None:
+    """Print a human-readable summary of the WAL."""
+    if not WAL_FILE.exists():
+        print(f"WAL file not found: {WAL_FILE}")
+        return
+    entries = []
+    errors = 0
+    with WAL_FILE.open(encoding="utf-8", errors="ignore") as f:
+        for i, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entries.append(json.loads(line))
+            except json.JSONDecodeError:
+                errors += 1
+                print(f"  [line {i}] INVALID JSON: {line[:80]}")
+
+    print(f"WAL: {WAL_FILE}")
+    print(f"  Total entries: {len(entries)}, parse errors: {errors}")
+    if not entries:
+        return
+
+    by_action: Dict[str, int] = {}
+    ips: set = set()
+    for e in entries:
+        action = e.get("action", "?")
+        by_action[action] = by_action.get(action, 0) + 1
+        if "ip" in e:
+            ips.add(e["ip"])
+
+    print(f"  Unique IPs: {len(ips)}")
+    print(f"  Actions:")
+    for action, count in sorted(by_action.items(), key=lambda x: -x[1]):
+        print(f"    {action}: {count}")
+
+    first_ts = entries[0].get("ts", "?")
+    last_ts  = entries[-1].get("ts", "?")
+    print(f"  Time range: {first_ts} → {last_ts}")
+    print(f"  Last 5 entries:")
+    for e in entries[-5:]:
+        print(f"    {json.dumps(e)}")
+
+
+def cmd_wal_replay(dry_run: bool = True) -> None:
+    """Re-apply WAL entries (add/remove CF rules) from the WAL log.
+
+    Use dry_run=True (default) to preview; pass --execute to actually apply.
+    """
+    if not WAL_FILE.exists():
+        print(f"WAL file not found: {WAL_FILE}")
+        return
+
+    adds: List[str] = []
+    removes: List[str] = []
+    with WAL_FILE.open(encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                e = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            action = e.get("action", "")
+            ip = e.get("ip", "")
+            if not ip:
+                continue
+            if action in ("add", "ban"):
+                adds.append(ip)
+            elif action in ("remove", "unban"):
+                removes.append(ip)
+
+    # Net state: last action per IP wins
+    net: Dict[str, str] = {}
+    with WAL_FILE.open(encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                e = json.loads(line)
+                ip = e.get("ip", "")
+                if ip:
+                    net[ip] = e.get("action", "?")
+            except json.JSONDecodeError:
+                continue
+
+    to_add    = [ip for ip, act in net.items() if act in ("add", "ban")]
+    to_remove = [ip for ip, act in net.items() if act in ("remove", "unban")]
+
+    print(f"WAL replay {'(DRY RUN)' if dry_run else '(EXECUTE)'}:")
+    print(f"  Net state: {len(to_add)} to add, {len(to_remove)} to remove")
+    for ip in to_add[:20]:
+        print(f"  + {ip}")
+    for ip in to_remove[:20]:
+        print(f"  - {ip}")
+    if not dry_run:
+        print("  Execute not yet implemented — use the main daemon loop instead.")
+
+
+def cmd_wal_compact() -> None:
+    """Collapse WAL to net state: one entry per IP, removes cancelling pairs."""
+    if not WAL_FILE.exists():
+        print(f"WAL file not found: {WAL_FILE}")
+        return
+
+    entries = []
+    with WAL_FILE.open(encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entries.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+
+    before = len(entries)
+    # Keep only the last entry per IP
+    net: Dict[str, dict] = {}
+    for e in entries:
+        ip = e.get("ip", "")
+        if ip:
+            net[ip] = e
+
+    compacted = list(net.values())
+    after = len(compacted)
+
+    print(f"WAL compact: {before} → {after} entries (removed {before - after} duplicates)")
+
+    bak = WAL_FILE.with_suffix(".jsonl.bak")
+    WAL_FILE.rename(bak)
+    with WAL_FILE.open("w", encoding="utf-8") as f:
+        for e in compacted:
+            f.write(json.dumps(e, ensure_ascii=False) + "\n")
+    print(f"  Backup: {bak}")
+    print(f"  Compacted WAL: {WAL_FILE}")
+
+
+# ── Doctor ────────────────────────────────────────────────────────────────────
+
+def cmd_doctor() -> int:
+    """System health audit. Returns exit code: 0=healthy, 1=degraded, 2=broken."""
+    print("=== crowdsec-cf-sync doctor ===\n")
+    ok_count = 0; warn_count = 0; fail_count = 0
+    hostname = socket.gethostname()
+
+    def chk_ok(label: str, detail: str = "") -> None:
+        nonlocal ok_count
+        ok_count += 1
+        print(f"  \033[32m[OK]\033[0m    {label}" + (f" — {detail}" if detail else ""))
+
+    def chk_warn(label: str, detail: str = "") -> None:
+        nonlocal warn_count
+        warn_count += 1
+        print(f"  \033[33m[WARN]\033[0m  {label}" + (f" — {detail}" if detail else ""))
+
+    def chk_fail(label: str, detail: str = "") -> None:
+        nonlocal fail_count
+        fail_count += 1
+        print(f"  \033[31m[FAIL]\033[0m  {label}" + (f" — {detail}" if detail else ""))
+
+    print(f"Host: {hostname}\n")
+
+    # ── Python daemon ──────────────────────────────────────────────────────────
+    print("── Python daemon ────────────────────────────────────────────────────")
+    try:
+        result = subprocess.run(
+            ["systemctl", "is-active", "crowdsec-cf-sync"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.stdout.strip() == "active":
+            chk_ok("Daemon active", "crowdsec-cf-sync.service")
+        else:
+            chk_fail("Daemon not active", result.stdout.strip())
+    except Exception as e:
+        chk_fail("Cannot query systemd", str(e))
+
+    # WAL
+    if WAL_FILE.exists():
+        wal_size = WAL_FILE.stat().st_size
+        chk_ok("WAL file exists", f"{WAL_FILE} ({wal_size:,} bytes)")
+    else:
+        chk_warn("WAL file missing", str(WAL_FILE))
+
+    # State files
+    for state_file in (RECIDIV_STATE, MODSEC_STATE, CIDR_STATE):
+        if state_file.exists():
+            chk_ok(f"State file: {state_file.name}")
+        else:
+            chk_warn(f"State file missing: {state_file.name}", "will be created on first run")
+
+    # ── Cloudflare ────────────────────────────────────────────────────────────
+    print("\n── Cloudflare ───────────────────────────────────────────────────────")
+    if not CF_API_TOKEN or not CF_ZONE_ID:
+        chk_fail("CF credentials missing", "CF_API_TOKEN or CF_ZONE_ID not set")
+    else:
+        try:
+            cf_rules = _fetch_cf_rules()
+            n = len(cf_rules)
+            chk_ok("CF API reachable", f"{n} active rules")
+            # Quota check
+            limit = 1000  # typical CF free limit
+            pct = (n / limit) * 100
+            if pct >= 95:
+                chk_fail(f"CF quota critical: {n}/{limit} rules ({pct:.0f}%)")
+            elif pct >= 85:
+                chk_warn(f"CF quota high: {n}/{limit} rules ({pct:.0f}%)")
+            elif pct >= 70:
+                chk_warn(f"CF quota elevated: {n}/{limit} rules ({pct:.0f}%)")
+            else:
+                chk_ok(f"CF quota OK: {n}/{limit} rules ({pct:.0f}%)")
+        except Exception as e:
+            chk_fail("CF API unreachable", str(e))
+
+    # ── CrowdSec LAPI ─────────────────────────────────────────────────────────
+    print("\n── CrowdSec LAPI ────────────────────────────────────────────────────")
+    if not CS_API_KEY:
+        chk_warn("CS_API_KEY not set", "CrowdSec integration disabled")
+    else:
+        try:
+            result = subprocess.run(
+                ["cscli", "decisions", "list", "--no-header", "-o", "raw"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode == 0:
+                chk_ok("CrowdSec LAPI reachable")
+            else:
+                chk_fail("CrowdSec LAPI error", result.stderr.strip()[:80])
+        except FileNotFoundError:
+            chk_warn("cscli not found in PATH")
+        except Exception as e:
+            chk_fail("CrowdSec check failed", str(e))
+
+    # ── Lua layer ─────────────────────────────────────────────────────────────
+    print("\n── Lua layer ────────────────────────────────────────────────────────")
+    if not LUA_ENABLED:
+        chk_warn("Lua layer disabled", "LUA_ENABLED=0")
+    else:
+        lua_status = _query_lua_status()
+        if lua_status is None:
+            chk_fail("Lua status endpoint unreachable", LUA_STATUS_URL)
+        else:
+            chk_ok("Lua status endpoint reachable", LUA_STATUS_URL)
+
+            sync_version = lua_status.get("sync", {}).get("version", 0)
+            sync_ts      = lua_status.get("sync", {}).get("ts", 0)
+            entries      = lua_status.get("sync", {}).get("entries", 0)
+            lua_syncs    = lua_status.get("counters", {}).get("lua_syncs", 0)
+
+            if sync_version and sync_version > 0:
+                chk_ok(f"Lua sync active", f"version={sync_version} entries={entries}")
+            else:
+                chk_fail("Lua sync_version=0", "bans.json not yet loaded by Lua")
+
+            if sync_ts:
+                age = int(time.time()) - sync_ts
+                if age < 120:
+                    chk_ok(f"Lua sync recent", f"{age}s ago")
+                elif age < 300:
+                    chk_warn(f"Lua sync aging", f"{age}s ago (threshold 120s)")
+                else:
+                    chk_fail(f"Lua sync stale", f"{age}s ago — deadman mode active")
+
+            # Dict memory
+            dh = lua_status.get("dict_health", {})
+            for dict_name, free_bytes in dh.items():
+                free_mb = free_bytes / (1024 * 1024)
+                if free_mb < 2:
+                    chk_fail(f"Dict low: {dict_name}", f"{free_mb:.1f} MB free")
+                elif free_mb < 10:
+                    chk_warn(f"Dict tight: {dict_name}", f"{free_mb:.1f} MB free")
+                else:
+                    chk_ok(f"Dict healthy: {dict_name}", f"{free_mb:.1f} MB free")
+
+    # ── Permissions ───────────────────────────────────────────────────────────
+    print("\n── Permissions ──────────────────────────────────────────────────────")
+    sync_dir = LUA_SYNC_DIR
+    if sync_dir.exists():
+        chk_ok(f"Sync dir exists", str(sync_dir))
+        bans_json = sync_dir / "bans.json"
+        if bans_json.exists():
+            mode = oct(bans_json.stat().st_mode)[-3:]
+            if mode == "644":
+                chk_ok("bans.json mode 644")
+            else:
+                chk_fail(f"bans.json mode {mode}", "expected 644 (OpenResty needs read)")
+        else:
+            chk_warn("bans.json not yet created")
+
+        events_jsonl = sync_dir / "events.jsonl"
+        if events_jsonl.exists():
+            mode = oct(events_jsonl.stat().st_mode)[-3:]
+            chk_ok(f"events.jsonl mode {mode}")
+        else:
+            chk_warn("events.jsonl not yet created")
+    else:
+        chk_fail(f"Sync dir missing: {sync_dir}", "run install-v3.sh")
+
+    # ── nginx/OpenResty config ────────────────────────────────────────────────
+    print("\n── nginx/OpenResty ──────────────────────────────────────────────────")
+    nginx_bin = "openresty" if shutil.which("openresty") else "nginx"
+    try:
+        result = subprocess.run(
+            [nginx_bin, "-t"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0:
+            chk_ok("nginx config syntax OK")
+        else:
+            chk_fail("nginx config has errors", result.stderr.strip()[:120])
+    except Exception as e:
+        chk_fail("Cannot run nginx -t", str(e))
+
+    # Check crowdsec_cf_sync_generated.conf is loaded
+    try:
+        result = subprocess.run(
+            [nginx_bin, "-T"],
+            capture_output=True, text=True, timeout=10,
+        )
+        dump = result.stdout
+        if "crowdsec_cf_sync_generated.conf" in dump or "cscf_verdicts" in dump:
+            chk_ok("crowdsec_cf_sync_generated.conf loaded")
+        else:
+            chk_warn("crowdsec_cf_sync_generated.conf not detected in active config",
+                     "run install-v3.sh")
+        if "cscf_verdicts" in dump:
+            chk_ok("lua_shared_dict cscf_verdicts declared")
+        else:
+            chk_warn("lua_shared_dict cscf_verdicts not found in active config")
+    except Exception:
+        pass
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    total = ok_count + warn_count + fail_count
+    print(f"\n── Summary ({total} checks) ───────────────────────────────────────────")
+    if fail_count == 0 and warn_count == 0:
+        print("\033[32m\033[1mSTATUS: HEALTHY\033[0m")
+        return 0
+    elif fail_count == 0:
+        print(f"\033[33m\033[1mSTATUS: DEGRADED\033[0m  ({ok_count} ok, {warn_count} warnings, 0 failures)")
+        return 1
+    else:
+        print(f"\033[31m\033[1mSTATUS: BROKEN\033[0m   ({ok_count} ok, {warn_count} warnings, {fail_count} failures)")
+        return 2
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main() -> None:
     global _boot_healthy, _degraded_reason, _wal_seq, _protected_networks
@@ -2222,7 +2679,7 @@ def main() -> None:
     log.info("Protected ranges: %d réseaux chargés", len(_protected_networks))
 
     log.info(
-        "=== CrowdSec CF Sync V3.2 démarré (interval=%ds | dry_run=%s | "
+        "=== CrowdSec CF Sync V3.3 démarré (interval=%ds | dry_run=%s | "
         "confidence=%s | health_port=%s | state_version=%d | lua=%s) ===",
         INTERVAL, DRY_RUN, CF_MIN_CONFIDENCE,
         HEALTH_PORT if HEALTH_PORT else "disabled",
@@ -2338,13 +2795,12 @@ def main() -> None:
             recidivists = purge_old_recidivists(recidivists)
 
             # ── Lua state push (after all local state is up to date) ──────────
-            # active_bans is re-derived here; sync_cloudflare already computed it
-            # but doesn't expose it. We call get_active_bans() which is cheap
-            # (cscli cache hit within the same cycle).
             if LUA_ENABLED and not _shutdown.is_set():
                 _active = get_active_bans()
                 if _active is not None:
                     push_lua_state(_active, cidr_state, modsec_state, recidivists)
+                # Auto-heal: check if Lua sync timer is alive
+                check_lua_autoheal()
 
             # WAF poll (every CF_WAF_POLL_SECS)
             waf_poll_count += 1
@@ -2404,4 +2860,27 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    # ── Subcommand dispatch ────────────────────────────────────────────────────
+    # Usage:
+    #   crowdsec-cf-syncV3.py               — run daemon (default)
+    #   crowdsec-cf-syncV3.py doctor        — system health audit
+    #   crowdsec-cf-syncV3.py wal inspect   — inspect WAL
+    #   crowdsec-cf-syncV3.py wal replay    — dry-run WAL replay
+    #   crowdsec-cf-syncV3.py wal replay --execute  — execute WAL replay
+    #   crowdsec-cf-syncV3.py wal compact   — compact WAL to net state
+    args = sys.argv[1:]
+    if args and args[0] == "doctor":
+        sys.exit(cmd_doctor())
+    elif args and args[0] == "wal":
+        sub = args[1] if len(args) > 1 else ""
+        if sub == "inspect":
+            cmd_wal_inspect()
+        elif sub == "replay":
+            cmd_wal_replay(dry_run="--execute" not in args)
+        elif sub == "compact":
+            cmd_wal_compact()
+        else:
+            print("Usage: wal <inspect|replay|compact>")
+            sys.exit(1)
+    else:
+        main()

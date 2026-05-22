@@ -46,6 +46,19 @@ end
 -- ── Core reload ───────────────────────────────────────────────────────────────
 
 local function load_sync_file()
+    local t0 = ngx.now()
+
+    -- ── Memory guard: refuse to load if dict is dangerously full ─────────────
+    local cache = cs.cache
+    local free_before = cache:free_space() or 0
+    if free_before < cs.DICT_MIN_FREE then
+        ngx.log(ngx.WARN,
+            "[crowdsec:sync] component=sync event=skip_low_memory",
+            " free_bytes=", free_before,
+            " threshold=", cs.DICT_MIN_FREE)
+        return
+    end
+
     local f, ferr = io.open(cs.SYNC_FILE, "r")
     if not f then
         -- File absent at first boot is normal; Python writes it after first cycle
@@ -60,7 +73,7 @@ local function load_sync_file()
 
     local data, perr = cjson.decode(content)
     if not data then
-        ngx.log(ngx.WARN, "[crowdsec:sync] JSON parse error: ", perr)
+        ngx.log(ngx.WARN, "[crowdsec:sync] component=sync event=parse_error error=", perr)
         return
     end
 
@@ -68,7 +81,6 @@ local function load_sync_file()
     local ver = tonumber(data.version) or 0
     if ver <= last_version then return end
 
-    local cache   = cs.cache
     local metrics = cs.metrics
     local state   = cs.state
 
@@ -84,8 +96,9 @@ local function load_sync_file()
         local actual_cidrs = 0; for _ in pairs(cidrs) do actual_cidrs = actual_cidrs + 1 end
         local actual = actual_bans + actual_cidrs
         if actual ~= expected then
-            ngx.log(ngx.WARN, "[crowdsec:sync] integrity check failed: expected ",
-                    expected, " entries, got ", actual, " — rejecting version ", ver)
+            ngx.log(ngx.WARN,
+                "[crowdsec:sync] component=sync event=integrity_fail",
+                " expected=", expected, " got=", actual, " version=", ver)
             return
         end
     end
@@ -102,12 +115,10 @@ local function load_sync_file()
         local score  = tonumber(info.score)  or 100
         local level  = tonumber(info.level)  or cs.score_to_level(score)
         local ttl    = tonumber(info.ttl)    or 3600
-        local source = info.reason           or "python"
 
         -- Don't downgrade an IP that heuristics escalated beyond Python's level
         local existing = cs.decode_verdict(cache:get("ip:" .. ip))
         if not existing or existing.level <= level then
-            -- Extended compact format: "level:score:src"
             cache:set("ip:" .. ip, level .. ":" .. score .. ":p", ttl)
         end
         loaded = loaded + 1
@@ -141,12 +152,18 @@ local function load_sync_file()
     metrics:set("lua_cache_entries", loaded)
     metrics:incr("lua_syncs", 1, 0)
 
-    -- Dict health metric (bytes remaining before eviction)
-    local free = cache:free_space()
-    if free then metrics:set("cache_free_bytes", free) end
+    -- Dict health metrics
+    local free_after = cache:free_space()
+    if free_after then metrics:set("cache_free_bytes", free_after) end
 
-    ngx.log(ngx.INFO, "[crowdsec:sync] loaded ", loaded,
-            " entries (version ", ver, ", free=", free or "?", "B)")
+    local dt_ms = math.floor((ngx.now() - t0) * 1000)
+    ngx.log(ngx.INFO,
+        "[crowdsec:sync] component=sync event=reload",
+        " version=", ver,
+        " entries=", loaded,
+        " duration_ms=", dt_ms,
+        " free_bytes=", free_after or "?",
+        " status=ok")
 end
 
 -- ── Public init ───────────────────────────────────────────────────────────────
