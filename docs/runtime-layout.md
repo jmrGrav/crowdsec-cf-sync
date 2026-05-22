@@ -109,4 +109,11 @@ Accessible only from loopback. Verify port: `openresty -T | grep -A2 'crowdsec-s
 | `systemctl reload openresty` | Workers soft-restart; `last_version` resets to 0; dicts preserved |
 | `systemctl restart openresty` | Full restart; all shared dicts cleared |
 
-After restarting the Python daemon without reloading OpenResty: Python's `_lua_sync_version` resets to 1, but Lua's `last_version` still holds the last accepted version. The sequence guard will silently reject Python's pushes until version catches up. **Always run `systemctl reload openresty` after restarting the Python daemon.**
+After restarting the Python daemon, its `_lua_sync_version` resets to 1. Lua's `last_version` upvalue (reset to 0 only on worker restart) needs to be reset so Python's version=1 push is accepted.
+
+**Correct deploy order:**
+1. Restart Python daemon (`systemctl restart crowdsec-cf-sync`)
+2. Wait 70 s for Python's first push to land in `bans.json` (version=1)
+3. Then reload OpenResty (`systemctl reload openresty`) — new workers load version=1, set `last_version=1`; push at version=2 is accepted
+
+**Wrong order (reload before restart):** New Lua workers load the old `bans.json` (version=N from before Python restart), set `last_version=N`. Python starts at version=1 — silently rejected for N cycles (up to hours).
