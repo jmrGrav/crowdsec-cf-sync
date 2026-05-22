@@ -2099,6 +2099,7 @@ def push_lua_state(
         # Raw JSON write (no versioning envelope — Lua reads it directly)
         content = json.dumps(payload, indent=2, ensure_ascii=False).encode()
         tmp_fd, tmp_path = tempfile.mkstemp(dir=LUA_SYNC_DIR, suffix=".tmp")
+        os.fchmod(tmp_fd, 0o644)  # www-data (OpenResty) must be able to read this
         try:
             with os.fdopen(tmp_fd, "wb") as f:
                 f.write(content)

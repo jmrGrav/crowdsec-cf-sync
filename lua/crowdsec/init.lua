@@ -6,7 +6,7 @@
 local M = {}
 
 -- ── Shared dicts ──────────────────────────────────────────────────────────────
-M.cache   = ngx.shared.crowdsec_cache    -- ip/cidr verdicts
+M.cache   = ngx.shared.cscf_verdicts    -- ip/cidr verdicts
 M.metrics = ngx.shared.crowdsec_metrics  -- counters
 M.state   = ngx.shared.crowdsec_state    -- sync metadata + tarpit semaphore
 

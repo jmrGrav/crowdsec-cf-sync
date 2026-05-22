@@ -36,7 +36,7 @@ function M.handle()
         tarpit_active = s("tarpit_active") or 0,
         -- Dict health (bytes free)
         dict_health = {
-            crowdsec_cache_free   = cache_free,
+            cscf_verdicts_free    = cache_free,
             crowdsec_metrics_free = metrics_free,
             crowdsec_state_free   = state_free,
         },
