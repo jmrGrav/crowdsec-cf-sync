@@ -2,6 +2,79 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.4.1] - 2026-05-23
+
+### Summary
+
+Challenge-first mitigation strategy with full false-positive correction. Rewrites the
+score→level mapping so heuristics can now produce Turnstile CAPTCHA challenges directly.
+Fixes a header-parsing bug that caused every request to score +30 above intended values,
+and fixes the CAPTCHA response architecture so Turnstile renders correctly from any path
+(not only from `/captcha-verify`).
+
+GoTestWAF grade target: eliminate the Application Security false-positive wall (was F/0%
+true-negatives) by fixing the raw header bug. API Security grade unchanged (A+).
+
+### Changed
+
+- **`init.lua` — `score_to_level()` — challenge-first strategy**:
+  - Old: `0→allow, 1+→ratelimit, 31+→tarpit, 61+→challenge, 81+→deny(403), 96+→deny(444)`
+  - New: `0–39→allow, 40–69→captcha, 70–89→deny(403), 90+→deny(444)`
+  - `LEVEL_RATELIMIT (1)`, `LEVEL_TARPIT (2)`, `LEVEL_CHALLENGE (3)` remain defined but are
+    no longer emitted by `score_to_level()`; still valid for LAPI-pushed verdicts.
+
+- **`mitigation.lua` — 444 threshold lowered** from score ≥ 96 to score ≥ 90 (aligns with
+  new mapping); LEVEL_CAPTCHA branch redesigned — see Bug Fix 2 below.
+
+- **Regression tests** (58 total, up from 47):
+  - Section L updated: L3 now asserts LEVEL_CAPTCHA IS in `score_to_level()` (expected).
+  - Section M updated: M1/M1b verify new CAPTCHA architecture (content-phase render).
+  - Section N (9 tests) — thresholds: N.A allow, N.B captcha+Turnstile, N.C deny-soft,
+    N.D deny-hard, N.E cookie-bypass LEVEL_DENY+ guard.
+
+### Fixed
+
+- **Bug 1 — `access.lua`: `ngx.req.get_headers(50, true)` raw=true** — the `raw=true`
+  parameter preserves original header casing (`User-Agent`, `Accept-Language`, `Accept`)
+  but all downstream lookups used lowercase keys (`user-agent`, `accept-language`,
+  `accept`), causing every key lookup to return nil. Effect: every request scored +30
+  extra from headers/UA regardless of what was sent, inflating all scores by 30 points.
+  A browser with full headers would score as high as a scanner with no headers.
+  - Fix: `ngx.req.get_headers(50)` — default lowercase mode; header lookups now work
+    as intended.
+  - Impact: real browsers with Accept-Language and Accept headers correctly score 0 for
+    those signals; bad UAs (zgrab, masscan) correctly score 30; curl's User-Agent scores 0.
+  - Scores: `/shell` + curl = 70 (was 90 → DENY hard); `/config.php` + browser = 60
+    (was 90 → CAPTCHA); `/setup.php` + browser = 50 (was 80 → CAPTCHA).
+
+- **Bug 2 — CAPTCHA render from access phase (error_page override)**: `captcha.render()`
+  called from `access_by_lua_block` calls `ngx.say(turnstile_html)` then `ngx.exit(403)`.
+  In the access phase, `ngx.exit(403)` triggers `error_page 403 /crowdsec-ban-page`, which
+  replaces the Turnstile HTML with the ban page before the response is sent.
+  - Fix: LEVEL_CAPTCHA in `mitigation.lua` now sets `crowdsec_block_reason = "captcha"` and
+    calls `ngx.exit(403)` directly — no `captcha.render()` in access phase.
+  - `snippets/crowdsec_ban_page.conf` content handler checks `crowdsec_block_reason`:
+    if `"captcha"`, calls `captcha.render()` from content phase (where `ngx.say()` output
+    is sent before `ngx.exit(403)` fires, preventing a second error_page redirect).
+  - Result: Turnstile challenge page served correctly for heuristic CAPTCHA escalations,
+    including the new case where heuristics produce LEVEL_CAPTCHA.
+
+- **Regression test timing**: section C log check now does `systemctl reload` before
+  `grep` to drain the `buffer=32k flush=5s` access log buffer.
+
+### Security invariants preserved
+
+All V3.4.0 security guarantees carry forward unchanged:
+- Bypass cookie HMAC enforced; expired/wrong-UA cookies rejected.
+- Cookie bypass still enforces LEVEL_DENY+ from LAPI (hard bans survive CAPTCHA solve).
+- LAPI-pushed verdicts take priority over heuristic scores (source="p" never downgraded).
+- Honeypots (/.env, /.git/config, /wp-admin/install.php, …) exit before scoring.
+- error_page loop prevention (`$crowdsec_error_page = 1`).
+- safe_path() open-redirect guard on CAPTCHA redirect target.
+- POST-only `/captcha-verify` (limit_except POST).
+- UA binding in captcha cookie (md5[:8]).
+- fail-closed CF token validation (network error → re-render, not bypass).
+
 ## [3.4.0] - 2026-05-23
 
 ### Added

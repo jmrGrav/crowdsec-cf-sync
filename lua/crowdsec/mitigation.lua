@@ -4,9 +4,9 @@
   LEVEL 0 → allow (no action)
   LEVEL 1 → rate limit (leaky bucket; 429 when exceeded)
   LEVEL 2 → tarpit (bounded sleep; 429 after)
-  LEVEL 3 → JS challenge hint (429 + header; caller handles redirect)
-  LEVEL 4 → CAPTCHA hint (403)
-  LEVEL 5 → hard deny: 403 (score < 96) or 444 (score ≥ 96)
+  LEVEL 3 → JS challenge hint (429 + header; LAPI-pushed only)
+  LEVEL 4 → CAPTCHA: 403 + Turnstile (heuristic score 40–69, or LAPI captcha verdict)
+  LEVEL 5 → soft deny: 403 ban page (score 70–89) or hard deny: 444 (score ≥ 90)
 
   ngx.exit() terminates the request phase immediately.
   All counters are incremented before exit so metrics are accurate.
@@ -65,13 +65,15 @@ function M.apply(verdict, ip)
     elseif level == cs.LEVEL_CAPTCHA then
         cs.metrics:incr("captchas", 1, 0)
         ngx.var.crowdsec_block_reason = "captcha"
-        require("crowdsec.captcha").render()
-        return
+        -- Delegate to error_page 403 → /crowdsec-ban-page (content phase).
+        -- Calling captcha.render() here (access phase) causes error_page 403 to
+        -- override our ngx.say() output with the ban page HTML before it reaches the client.
+        ngx.exit(ngx.HTTP_FORBIDDEN)
 
     -- ── Level 5+: hard deny ───────────────────────────────────────────────────
     else
         cs.metrics:incr("denies", 1, 0)
-        if score >= 96 then
+        if score >= 90 then
             -- 444 = silent drop (nginx extension); no response sent
             ngx.exit(444)
         else

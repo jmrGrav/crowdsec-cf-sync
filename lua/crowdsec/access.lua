@@ -101,7 +101,7 @@ function M.check()
         -- Skip when stale: avoids false-positives from outdated scoring.
         -- Skip when memory pressure: avoids writing new entries to a nearly-full dict.
         if not stale and not mem_pressure and not skip_heuristics then
-            local hdrs = ngx.req.get_headers(50, true)
+            local hdrs = ngx.req.get_headers(50)
             local delta = heuristics.score_request(ip, uri, method, hdrs)
 
             if delta > 0 then

@@ -1,5 +1,5 @@
 #!/bin/bash
-# regression-test.sh — Non-regression suite for crowdsec-cf-sync V3.3.x
+# regression-test.sh — Non-regression suite for crowdsec-cf-sync V3.4.x
 #
 # Tests: /ping bypass, ban page (all paths), cs_reason, headers, Vector, dict sanity,
 #        Turnstile CAPTCHA workflow (section M)
@@ -154,16 +154,18 @@ step "C. Ban page — heuristic deny (/shell)"
 
 restart_openresty
 
-# /shell: exact PATH_SCORES=60, no UA (+15), no Accept-Language (+10), no Accept (+5) = score 90
-# → LEVEL_DENY, score<96 → crowdsec_block_reason="heuristic" → error_page → ban.html
-status=$(${CURL} -A "" -H "Accept:" \
+# /shell: PATH_SCORES=60, no Accept-Language (+10), curl UA (+0), Accept:*/* (+0) = score 70
+# → LEVEL_DENY (score≥70), score<90 → crowdsec_block_reason="heuristic" → error_page → ban.html
+status=$(${CURL} \
     -o /tmp/rt_heuristic.html -w "%{http_code}" "https://${NGINX_HOST}/shell" 2>/dev/null)
 bytes=$(wc -c < /tmp/rt_heuristic.html 2>/dev/null || echo 0)
 
 [ "$status" = "403" ]   && ok  "Heuristic deny /shell: status 403"        || fail "Heuristic deny /shell: status=$status"
 [ "$bytes"  -gt 10000 ] && ok  "Heuristic ban.html: >10 KB ($bytes bytes)" || fail "Heuristic ban.html: $bytes bytes"
 
-sleep 1
+# access_log uses buffer=32k flush=5s; reload drains worker buffers before the grep
+sudo systemctl reload openresty >/dev/null 2>&1
+sleep 2
 shell_line=$(last_log_line '"GET /shell')
 if [ -n "$shell_line" ]; then
     echo "$shell_line" | grep -q "cs_reason=heuristic" \
@@ -177,8 +179,8 @@ grep -qi "heuristic" /tmp/rt_heuristic.html 2>/dev/null \
     && ok  "Heuristic ban.html: 'heuristic' visible in page content" \
     || fail "Heuristic ban.html: 'heuristic' not in page"
 
-# ── D. Silent drop — score ≥ 96 ──────────────────────────────────────────────
-step "D. Score ≥ 96 → 444 silent drop"
+# ── D. Silent drop — score ≥ 90 ──────────────────────────────────────────────
+step "D. Score ≥ 90 → 444 silent drop"
 
 # Strategy: honeypot adds score=100 to dict. The NEXT request finds score=100 in dict
 # via lookup.get_verdict() → level=LEVEL_DENY → mitigation.apply(score=100) → 444.
@@ -189,11 +191,11 @@ restart_openresty
 ${CURL} -A "curl/8.5.0" -H "Accept: */*" -H "Accept-Language: en" \
     -o /dev/null -w "" "https://${NGINX_HOST}/.env" >/dev/null 2>&1 || true
 
-# Request 2: lookup finds score=100 → mitigation.apply → score≥96 → ngx.exit(444)
+# Request 2: lookup finds score=100 → mitigation.apply → score≥90 → ngx.exit(444)
 status=$(${CURL} -A "curl/8.5.0" -H "Accept: */*" -H "Accept-Language: en" \
     -o /dev/null -w "%{http_code}" "https://${NGINX_HOST}/" 2>/dev/null) || status="000"
-[ "$status" = "000" ] && ok  "Score≥96: 444 silent drop (curl status=000)" \
-                        || fail "Score≥96: expected 000, got $status"
+[ "$status" = "000" ] && ok  "Score≥90: 444 silent drop (curl status=000)" \
+                        || fail "Score≥90: expected 000, got $status"
 
 # ── E. Ban page — nginx deny all ─────────────────────────────────────────────
 step "E. Ban page — nginx deny all (/.well-known/)"
@@ -215,7 +217,8 @@ step "F. Ban page response headers"
 
 restart_openresty
 
-${CURL} -A "" -H "Accept:" \
+# score 70 (shell=60 + no Accept-Language=10) → LEVEL_DENY soft → 403 ban page → headers present
+${CURL} \
     -o /dev/null -D /tmp/rt_headers.txt \
     "https://${NGINX_HOST}/shell" >/dev/null 2>&1 || true
 sleep 1
@@ -455,17 +458,16 @@ PYEOF
     && ok  "L2: cs_reason=captcha is inside LEVEL_CAPTCHA branch (not misplaced)" \
     || warn "L2: could not verify placement — manual review recommended (py_out=$py_out)"
 
-# L3: score_to_level() does NOT map any score to LEVEL_CAPTCHA (confirmed unreachable from heuristics)
-grep -q 'LEVEL_CAPTCHA' /etc/openresty/lua/crowdsec/init.lua && \
+# L3: score_to_level() maps 40–69 to LEVEL_CAPTCHA (V3.4.1 challenge-first strategy)
 python3 -c "
 src = open('/etc/openresty/lua/crowdsec/init.lua').read()
 import re
 fn = re.search(r'score_to_level.*?end', src, re.DOTALL)
 block = fn.group(0) if fn else ''
-print('CAPTCHA_IN_FN' if 'LEVEL_CAPTCHA' in block else 'CAPTCHA_NOT_IN_SCORE_FN')
-" 2>/dev/null | grep -q "CAPTCHA_NOT_IN_SCORE_FN" \
-    && ok  "L3: score_to_level() does not map any score to LEVEL_CAPTCHA (LAPI-only path, expected)" \
-    || warn "L3: unexpected LEVEL_CAPTCHA reference in score_to_level() — verify init.lua"
+print('CAPTCHA_IN_FN' if 'LEVEL_CAPTCHA' in block else 'CAPTCHA_NOT_IN_FN')
+" 2>/dev/null | grep -q "CAPTCHA_IN_FN" \
+    && ok  "L3: score_to_level() maps 40-69 → LEVEL_CAPTCHA (heuristics can escalate to CAPTCHA)" \
+    || fail "L3: LEVEL_CAPTCHA missing from score_to_level() — init.lua may be pre-V3.4.1"
 
 # ── M. Turnstile CAPTCHA workflow ─────────────────────────────────────────────
 # LEVEL_CAPTCHA is only reachable via LAPI-pushed verdicts (score_to_level()
@@ -477,10 +479,32 @@ CAPTCHA_LUA="/etc/openresty/lua/crowdsec/captcha.lua"
 TURNSTILE_ENV="/etc/crowdsec/turnstile.env"
 CAPTCHA_SNIPPET="/usr/local/openresty/nginx/conf/snippets/crowdsec_captcha.conf"
 
-# M1: captcha.render() is wired into LEVEL_CAPTCHA in mitigation.lua (code-path)
-grep -q 'require.*crowdsec\.captcha.*\.render\(\)' /etc/openresty/lua/crowdsec/mitigation.lua \
-    && ok  "M1: mitigation.lua LEVEL_CAPTCHA → captcha.render() (static analysis)" \
-    || fail "M1: captcha.render() not wired into LEVEL_CAPTCHA branch"
+# M1: LEVEL_CAPTCHA architecture — access phase exits 403 (no captcha.render() there),
+# then error_page → /crowdsec-ban-page (content phase) calls captcha.render().
+# Calling captcha.render() from access phase causes error_page to override the output.
+python3 - <<'PYEOF'
+import re, sys
+src = open("/etc/openresty/lua/crowdsec/mitigation.lua").read()
+m = re.search(r'LEVEL_CAPTCHA.*?(?=LEVEL_\w+:|else\b)', src, re.DOTALL)
+block = m.group(0) if m else ""
+# Strip Lua line-comments before checking for captcha.render absence
+code_only = re.sub(r'--[^\n]*', '', block)
+ok = (
+    'crowdsec_block_reason' in block and '"captcha"' in block and
+    'HTTP_FORBIDDEN' in block and
+    'captcha.render' not in code_only
+)
+sys.exit(0 if ok else 1)
+PYEOF
+[ $? -eq 0 ] \
+    && ok  "M1: LEVEL_CAPTCHA sets block_reason=captcha + ngx.exit(403) — no captcha.render() in access phase" \
+    || fail "M1: LEVEL_CAPTCHA architecture broken in mitigation.lua"
+
+BAN_PAGE_CONF="/usr/local/openresty/nginx/conf/snippets/crowdsec_ban_page.conf"
+grep -q 'crowdsec_block_reason.*==.*"captcha"' "$BAN_PAGE_CONF" && \
+grep -q 'captcha.*render\(\)' "$BAN_PAGE_CONF" \
+    && ok  "M1b: ban_page.conf routes block_reason=captcha to captcha.render() (content phase)" \
+    || fail "M1b: captcha routing missing from ban_page.conf"
 
 # M2: GET /captcha-verify → 403 (limit_except POST denies GET at nginx level)
 m2_status=$(${CURL} -o /dev/null -w "%{http_code}" "https://${NGINX_HOST}/captcha-verify")
@@ -591,6 +615,74 @@ m8_new=$(sudo tail -n +$((m8_before + 1)) "${ACCESS_LOG}" 2>/dev/null | \
 [ "$m8_new" -le 1 ] \
     && ok  "M8: no error_page loop — ${m8_new} log entry for /captcha-verify POST" \
     || fail "M8: possible loop — $m8_new entries for /captcha-verify (expected ≤1)"
+
+# ── N. Mitigation thresholds — challenge-first strategy ──────────────────────
+step "N. Mitigation thresholds (challenge-first: 0–39 allow / 40–69 captcha / 70–89 deny / 90+ hard)"
+
+# N.A: Score ~0 (full browser headers, clean path) → LEVEL_ALLOW → 200/404 (not 403/000)
+restart_openresty
+status_na=$(${CURL} \
+    -A "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36" \
+    -H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" \
+    -H "Accept-Language: fr-FR,fr;q=0.9,en;q=0.8" \
+    -o /dev/null -w "%{http_code}" "https://${NGINX_HOST}/" 2>/dev/null)
+[ "$status_na" != "403" ] && [ "$status_na" != "000" ] \
+    && ok  "N.A score≈0: HTTP ${status_na} (LEVEL_ALLOW — not blocked)" \
+    || fail "N.A score≈0: unexpected block status=${status_na} (expected 2xx/3xx/4xx≠403)"
+
+# N.B: Score ~60 → LEVEL_CAPTCHA → HTTP 403 + Turnstile widget
+# /config.php (50) + no Accept-Language (+10) + browser UA (0) + Accept present (0) = 60
+restart_openresty
+status_nb=$(${CURL} \
+    -A "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36" \
+    -H "Accept: text/html,application/xhtml+xml" \
+    -o /tmp/rt_captcha_nb.html -w "%{http_code}" \
+    "https://${NGINX_HOST}/config.php" 2>/dev/null)
+[ "$status_nb" = "403" ] \
+    && ok  "N.B score≈60: HTTP 403 (LEVEL_CAPTCHA)" \
+    || fail "N.B score≈60: expected 403, got ${status_nb}"
+grep -qi "cf-turnstile\|challenges\.cloudflare\.com/turnstile" /tmp/rt_captcha_nb.html 2>/dev/null \
+    && ok  "N.B CAPTCHA: Turnstile widget present in response body" \
+    || fail "N.B CAPTCHA: Turnstile widget not found (captcha.render() may not have been called)"
+
+# N.C: Score ~70 → LEVEL_DENY soft → HTTP 403 ban page (NOT Turnstile)
+# /shell (60) + no Accept-Language (+10) + curl UA (0) + Accept:*/* (0) = 70
+restart_openresty
+status_nc=$(${CURL} \
+    -o /tmp/rt_soft_deny_nc.html -w "%{http_code}" \
+    "https://${NGINX_HOST}/shell" 2>/dev/null)
+[ "$status_nc" = "403" ] \
+    && ok  "N.C score≈70: HTTP 403 (LEVEL_DENY soft)" \
+    || fail "N.C score≈70: expected 403, got ${status_nc}"
+grep -qi "crowdsec\|CrowdSec\|Forbidden\|Motif\|blocked\|banni" /tmp/rt_soft_deny_nc.html 2>/dev/null \
+    && ok  "N.C ban page: CrowdSec ban content found" \
+    || fail "N.C ban page: CrowdSec content absent (ban.html not served?)"
+grep -qi "cf-turnstile\|challenges\.cloudflare\.com/turnstile" /tmp/rt_soft_deny_nc.html 2>/dev/null \
+    && fail "N.C ban page: unexpected Turnstile widget (score 70 must serve ban page, not CAPTCHA)" \
+    || ok  "N.C ban page: no Turnstile — correct (deny soft ≠ captcha)"
+sleep 1
+nc_log=$(last_log_line '"GET /shell')
+if [ -n "$nc_log" ]; then
+    echo "$nc_log" | grep -q "cs_reason=heuristic" \
+        && ok  "N.C access log: cs_reason=heuristic for soft deny" \
+        || fail "N.C access log: $(echo "$nc_log" | grep -o 'cs_reason=[^ ]*') (expected heuristic)"
+else
+    warn "N.C access log: no /shell entry (log buffered?)"
+fi
+
+# N.D: Score ≥ 90 → LEVEL_DENY hard → 444 silent drop (curl=000)
+# /shell (60) + no UA (+15) + no Accept-Language (+10) + no Accept (+5) = 90
+restart_openresty
+status_nd=$(${CURL} -A "" -H "Accept:" \
+    -o /dev/null -w "%{http_code}" "https://${NGINX_HOST}/shell" 2>/dev/null) || status_nd="000"
+[ "$status_nd" = "000" ] \
+    && ok  "N.D score≈90: 444 silent drop (curl=000) — hard deny threshold" \
+    || fail "N.D score≈90: expected 000, got ${status_nd} (threshold may not be 90)"
+
+# N.E: Cookie bypass enforces LEVEL_DENY+ — static analysis (runtime tested in M5/M6)
+grep -q "hard.level >= cs.LEVEL_DENY" lua/crowdsec/access.lua \
+    && ok  "N.E cookie bypass: LAPI LEVEL_DENY+ guard present in access.lua" \
+    || fail "N.E cookie bypass: LEVEL_DENY guard missing in access.lua"
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""

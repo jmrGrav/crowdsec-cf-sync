@@ -66,14 +66,20 @@ M.LEVEL_CAPTCHA   = 4  -- CAPTCHA redirect (or 403)
 M.LEVEL_DENY      = 5  -- 403 (score < 96) or 444 (score >= 96)
 M.LEVEL_ESCALATE  = 6  -- reserved; Python daemon handles CF escalation
 
--- ── Score → level mapping ─────────────────────────────────────────────────────
+-- ── Score → level mapping — challenge-first strategy ─────────────────────────
+--   0–39  → allow   (legitimate traffic; borderline cases pass through)
+--   40–69 → captcha (Turnstile human verification; resolves transparently for real users)
+--   70–89 → deny    (403 ban page; confident bot or attacker)
+--   90+   → deny    (444 silent drop; high-confidence / recidivist)
+--
+-- LEVEL_RATELIMIT / LEVEL_TARPIT / LEVEL_CHALLENGE (1–3) are no longer emitted
+-- by local heuristics but remain valid for LAPI-pushed verdicts.
+-- The 403 vs 444 distinction at LEVEL_DENY is made in mitigation.lua by score threshold.
 function M.score_to_level(score)
-    if score >= 96 then return M.LEVEL_DENY       -- silent drop (444)
-    elseif score >= 81 then return M.LEVEL_DENY   -- 403
-    elseif score >= 61 then return M.LEVEL_CHALLENGE
-    elseif score >= 31 then return M.LEVEL_TARPIT
-    elseif score >= 1  then return M.LEVEL_RATELIMIT
-    else return M.LEVEL_ALLOW
+    if     score >= 90 then return M.LEVEL_DENY    -- hard: 444 silent drop
+    elseif score >= 70 then return M.LEVEL_DENY    -- soft: 403 ban page
+    elseif score >= 40 then return M.LEVEL_CAPTCHA -- Turnstile challenge
+    else                     return M.LEVEL_ALLOW
     end
 end
 
