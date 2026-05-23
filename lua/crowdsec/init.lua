@@ -48,6 +48,16 @@ M.FAIL_OPEN = true
 -- MEM_PRESSURE_PCT: when cscf_verdicts is fuller than this %, suppress new
 --   heuristic writes (dict reads and existing verdict lookups still work).
 --   Soft layer before DICT_MIN_FREE hard-stop.
+-- ── V3.5.0: AppSec fusion constants ──────────────────────────────────────────
+-- APPSEC_SCORE: score added when CrowdSec AppSec (Coraza/CRS) confirms a WAF
+--   match on this request.  70 puts the IP squarely in LEVEL_DENY territory;
+--   combined with mild heuristics (≥20) it escalates to hard 444.
+-- RECIDIVE_BONUS_PCT: if the IP already has a heuristic score in the dict,
+--   its new behavioral delta is boosted by this percentage — recidivists
+--   escalate faster.
+M.APPSEC_SCORE        = 70           -- Coraza WAF match → adds 70 to fusion score
+M.RECIDIVE_BONUS_PCT  = 25           -- % boost on delta for already-scored IPs
+
 M.DEADMAN_SECS        = 120          -- 2 min without sync → stale mode
 M.DICT_MIN_FREE       = 2097152      -- 2 MB: hard stop — no new entries below this
 M.BANS_JSON_MAX_BYTES = 10485760     -- 10 MB: reject oversized bans.json

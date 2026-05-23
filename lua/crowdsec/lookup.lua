@@ -78,6 +78,11 @@ function M.add_heuristic_score(ip, delta, ttl)
     local raw   = cache:get(key)
     local cur   = cs.decode_verdict(raw)
 
+    -- Recidive bonus: IP already has a heuristic score → escalate faster.
+    if cur and cur.source == "h" then
+        delta = math.ceil(delta * (1 + cs.RECIDIVE_BONUS_PCT / 100))
+    end
+
     local old_score = cur and cur.score or 0
     local new_score = math.min(100, old_score + delta)
     local new_level = cs.score_to_level(new_score)

@@ -53,8 +53,28 @@ local function b64url_dec(s)
 end
 
 -- Sign ts:ua_hash with HMAC-SHA256
+-- ngx.hmac_sha256 was removed in OpenResty ≥1.19.9; use resty.openssl.hmac.
+local _hmac_fn
 local function sign(payload)
-    return to_hex(ngx.hmac_sha256(SECRET, payload))
+    if not _hmac_fn then
+        if ngx.hmac_sha256 then
+            _hmac_fn = function(k, d) return ngx.hmac_sha256(k, d) end
+        else
+            local ossl_hmac = require "resty.openssl.hmac"
+            _hmac_fn = function(k, d)
+                local h, err = ossl_hmac.new(k, "sha256")
+                if not h then
+                    ngx.log(ngx.ERR, "[crowdsec:captcha] HMAC init error: ", err)
+                    return nil
+                end
+                h:update(d)
+                return h:final()
+            end
+        end
+    end
+    local digest = _hmac_fn(SECRET, payload)
+    if not digest then return "" end
+    return to_hex(digest)
 end
 
 -- Read a named cookie from the current request
@@ -212,9 +232,11 @@ end
 -- redirect_hint: optional redirect path to preserve across re-renders (e.g. original URI).
 function M.render(redirect_hint)
     local redirect = safe_path(redirect_hint or ngx.var.request_uri)
+    local sitekey_val = SITEKEY ~= "" and SITEKEY or "MISSING_SITEKEY"
+    local redirect_val = html_attr(redirect)
     local body = CAPTCHA_HTML
-        :gsub("__SITEKEY__", SITEKEY ~= "" and SITEKEY or "MISSING_SITEKEY")
-        :gsub("__REDIRECT__", html_attr(redirect))
+        :gsub("__SITEKEY__", function() return sitekey_val end)
+        :gsub("__REDIRECT__", function() return redirect_val end)
 
     ngx.status = ngx.HTTP_FORBIDDEN
     ngx.header["Content-Type"]            = "text/html; charset=utf-8"

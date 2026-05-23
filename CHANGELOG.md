@@ -2,6 +2,69 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.5.0] - 2026-05-23
+
+### Summary
+
+In-band AppSec fusion: CrowdSec Coraza/CRS (AppSec) signal integrated as a score
+contributor into the Lua behavioral engine. `final_score = lua_score + appsec_delta`;
+AppSec becomes a high-quality signal provider while the Lua engine remains the
+decision layer. CAPTCHA challenge preserved as the default escalation for borderline
+IPs (40–69); AppSec WAF matches (70 pts) push directly to LEVEL_DENY.
+
+Also fixes a critical `ngx.hmac_sha256` nil error in `captcha.lua` (removed in
+OpenResty ≥ 1.19.9) that caused the entire `check()` pcall to fail-open, silently
+bypassing all CrowdSec checks for every request.
+
+### Added
+
+- **`init.lua` — V3.5.0 AppSec fusion constants**:
+  - `APPSEC_SCORE = 70` — score added when Coraza/CRS confirms a WAF match; 70 puts
+    the IP squarely in LEVEL_DENY territory (score ≥ 70).
+  - `RECIDIVE_BONUS_PCT = 25` — % boost applied to any heuristic delta when the IP
+    already has a score in the shared dict (recidivists escalate faster).
+
+- **`lookup.lua` — recidive bonus in `add_heuristic_score()`**: if `cur.source == "h"`,
+  the incoming delta is multiplied by `1 + RECIDIVE_BONUS_PCT/100` (ceil). Applied to
+  both AppSec and behavioral heuristic deltas.
+
+- **`access.lua` — step 3b: in-band AppSec check** (`$crowdsec_appsec_fusion = 1`):
+  - Calls `cs_official.AppSecCheck(ip)` directly (one HTTP round-trip to 127.0.0.1:7422,
+    ~1-3ms). Returns ok=false → appsec_delta = APPSEC_SCORE (70).
+  - Score persisted to shared dict BEFORE behavioral heuristics (step 4) so the
+    recidive_bonus logic in `add_heuristic_score()` sees it.
+  - Under memory pressure: AppSec verdict applied inline (no dict write), avoids OOM.
+  - Enabled per-vhost: `set $crowdsec_appsec_fusion 1;` + `set $crowdsec_disable_appsec 1;`
+    (the `disable_appsec` flag prevents cs.Allow() from making a redundant second
+    AppSec call).
+  - Guard: pcall on `ngx.var.crowdsec_appsec_fusion` prevents "variable not found"
+    errors in vhosts that do not declare it.
+
+- **`captcha.lua` — gsub replacement fix**: `render()` now uses function-form gsub
+  (`function() return val end`) instead of string replacement for `__SITEKEY__` and
+  `__REDIRECT__`. Prevents `invalid capture index` runtime error when redirect URL
+  contains `%XX` percent-encoded sequences (e.g. XSS payloads in the original URI).
+
+### Fixed
+
+- **`captcha.lua` — `ngx.hmac_sha256` nil dereference (critical)**:
+  - OpenResty ≥ 1.19.9 removed `ngx.hmac_sha256`. Calling it returned nil, causing
+    `attempt to call field 'hmac_sha256' (a nil value)` inside `sign()`.
+  - The error propagated to `check()` via pcall, causing ALL requests to fail-open
+    (silent bypass of honeypot, heuristics, verdict enforcement).
+  - Fix: lazy `_hmac_fn` initializer checks `ngx.hmac_sha256` first; if nil, falls back
+    to `resty.openssl.hmac` (HMAC-SHA256 via OpenSSL FFI). Backward-compatible.
+
+### Security invariants preserved
+
+- LAPI-pushed verdicts (source="p") are never downgraded by AppSec score.
+- AppSec check gated on `not skip_heuristics` — monitoring paths unaffected.
+- Stale mode (deadman): AppSec score IS persisted (Coraza/CRS is always fresh); soft
+  verdicts below LEVEL_DENY are still suspended in stale mode.
+- Fail-open pcall wrapper in `check()` ensures any AppSec error passes the request
+  rather than hard-faulting nginx.
+- Cookie bypass still enforces hard LAPI denies (LEVEL_DENY+) even when AppSec enabled.
+
 ## [3.4.1] - 2026-05-23
 
 ### Summary

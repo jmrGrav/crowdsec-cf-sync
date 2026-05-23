@@ -9,14 +9,20 @@
     1. Honeypot check   → instant deny + escalation event
     2. Deadman check    → if sync stale, suspend soft mitigations
     3. Verdict lookup   → shared dict only, O(1)
-    4. Local heuristics → accumulate score (skipped when stale)
+    3b. AppSec check    → in-band Coraza/CRS signal (appsec_delta, V3.5.0)
+                          Enabled per-vhost: set $crowdsec_appsec_fusion 1
+                          Requires cs.Allow() AppSec leg disabled:
+                            set $crowdsec_disable_appsec 1  (avoid double call)
+    4. Local heuristics → accumulate score (skipped when stale/mem_pressure)
+    4b. Fusion score    → heuristic_delta + appsec_delta → single write to dict
     5. Apply mitigation → ngx.exit() if action required
 
   Entire check() is wrapped in pcall: any Lua/module error is logged and
   the request passes (fail-open). This ensures nginx never hard-errors on
   a module bug or shared dict unavailability.
 
-  Zero network I/O. Zero file I/O. Per-request overhead < 50µs typical.
+  V3.5.0 note: step 3b adds one HTTP round-trip (~1-3ms) to 127.0.0.1:7422
+  for vhosts with $crowdsec_appsec_fusion=1. All other vhosts are unaffected.
 --]]
 
 local M          = {}
@@ -97,9 +103,53 @@ function M.check()
             return
         end
 
+        -- ── 3b. AppSec check (in-band Coraza/CRS signal — V3.5.0) ───────────────
+        -- Runs when $crowdsec_appsec_fusion=1 AND heuristics are not skipped.
+        -- Requires $crowdsec_disable_appsec=1 in the vhost so cs.Allow() does
+        -- not also call AppSec (would be a redundant second HTTP round-trip).
+        -- AppSec score is persisted to the shared dict independently of the
+        -- stale guard (Coraza/CRS is always fresh, unlike bans.json).
+        -- Under memory pressure: AppSec verdict is applied inline only.
+        local appsec_delta = 0
+        -- $crowdsec_appsec_fusion is set per-vhost (not globally declared), so
+        -- pcall guards against the "variable not found" error in vhosts that
+        -- don't declare it.  fusion=true only when vhost sets it to "1".
+        local _fok, _fv  = pcall(function() return ngx.var.crowdsec_appsec_fusion end)
+        local appsec_fusion = _fok and _fv == "1"
+        if appsec_fusion and not skip_heuristics then
+            local cs_official = require "crowdsec"
+            local appsec_ok, _, _, appsec_err = cs_official.AppSecCheck(ip)
+            if not appsec_ok and not appsec_err then
+                cs.metrics:incr("appsec_blocks", 1, 0)
+                appsec_delta = cs.APPSEC_SCORE
+            end
+        end
+
+        -- Persist AppSec signal immediately (before behavioral heuristics run).
+        -- This ensures AppSec score is visible to the recidive_bonus logic in
+        -- lookup.add_heuristic_score() when heuristics accumulate on top.
+        if appsec_delta > 0 then
+            if not mem_pressure then
+                local av = lookup.add_heuristic_score(ip, appsec_delta)
+                if av and (not verdict or av.level > verdict.level) then
+                    verdict = av
+                end
+            else
+                -- Dict nearly full: apply inline verdict for this request only.
+                local base = verdict and verdict.score or 0
+                local fs   = math.min(100, base + appsec_delta)
+                local fl   = cs.score_to_level(fs)
+                if not verdict or fl > verdict.level then
+                    verdict = { level = fl, score = fs, source = "a" }
+                end
+            end
+        end
+
         -- ── 4. Local heuristics (suspended when stale or under memory pressure) ──
         -- Skip when stale: avoids false-positives from outdated scoring.
         -- Skip when memory pressure: avoids writing new entries to a nearly-full dict.
+        -- score_request() internally calls add_heuristic_score(); the behavioral
+        -- delta accumulates on top of any AppSec score already written in step 3b.
         if not stale and not mem_pressure and not skip_heuristics then
             local hdrs = ngx.req.get_headers(50)
             local delta = heuristics.score_request(ip, uri, method, hdrs)
