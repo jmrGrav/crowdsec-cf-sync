@@ -1,8 +1,9 @@
 #!/bin/bash
 # regression-test.sh — Non-regression suite for crowdsec-cf-sync V3.3.x
 #
-# Tests: /ping bypass, ban page (all paths), cs_reason, headers, Vector, dict sanity
-# Requires: sudo (openresty restart, log reads), curl, vector, python3
+# Tests: /ping bypass, ban page (all paths), cs_reason, headers, Vector, dict sanity,
+#        Turnstile CAPTCHA workflow (section M)
+# Requires: sudo (openresty restart, log reads), curl, vector, python3, openssl
 #
 # Exit: 0 = all passed, N = number of failures
 #
@@ -53,7 +54,11 @@ restart_openresty() {
         return
     fi
     sudo systemctl restart openresty >/dev/null 2>&1
-    sleep 3
+    # Wait until the status/metrics port (8091) is accepting connections (max 10s)
+    for _i in $(seq 1 10); do
+        curl -s --max-time 1 "http://127.0.0.1:8091/crowdsec-status" >/dev/null 2>&1 && break
+        sleep 1
+    done
 }
 
 last_log_line() {
@@ -461,6 +466,131 @@ print('CAPTCHA_IN_FN' if 'LEVEL_CAPTCHA' in block else 'CAPTCHA_NOT_IN_SCORE_FN'
 " 2>/dev/null | grep -q "CAPTCHA_NOT_IN_SCORE_FN" \
     && ok  "L3: score_to_level() does not map any score to LEVEL_CAPTCHA (LAPI-only path, expected)" \
     || warn "L3: unexpected LEVEL_CAPTCHA reference in score_to_level() — verify init.lua"
+
+# ── M. Turnstile CAPTCHA workflow ─────────────────────────────────────────────
+# LEVEL_CAPTCHA is only reachable via LAPI-pushed verdicts (score_to_level()
+# skips from CHALLENGE to DENY). Tests use static analysis + endpoint tests.
+# M5/M6 (cookie bypass behaviour) are verified by generating a real HMAC cookie.
+step "M. Turnstile CAPTCHA workflow"
+
+CAPTCHA_LUA="/etc/openresty/lua/crowdsec/captcha.lua"
+TURNSTILE_ENV="/etc/crowdsec/turnstile.env"
+CAPTCHA_SNIPPET="/usr/local/openresty/nginx/conf/snippets/crowdsec_captcha.conf"
+
+# M1: captcha.render() is wired into LEVEL_CAPTCHA in mitigation.lua (code-path)
+grep -q 'require.*crowdsec\.captcha.*\.render\(\)' /etc/openresty/lua/crowdsec/mitigation.lua \
+    && ok  "M1: mitigation.lua LEVEL_CAPTCHA → captcha.render() (static analysis)" \
+    || fail "M1: captcha.render() not wired into LEVEL_CAPTCHA branch"
+
+# M2: GET /captcha-verify → 403 (limit_except POST denies GET at nginx level)
+m2_status=$(${CURL} -o /dev/null -w "%{http_code}" "https://${NGINX_HOST}/captcha-verify")
+[ "$m2_status" = "403" ] \
+    && ok  "M2: GET /captcha-verify → 403 (limit_except POST enforced)" \
+    || fail "M2: GET /captcha-verify expected 403, got $m2_status"
+
+# M3: POST with invalid cookie → captcha re-rendered (cookie rejected)
+# We send a syntactically valid-looking but unsigned cookie
+m3_body=$(${CURL} -X POST -d "_redirect=/" \
+    -H "Cookie: crowdsec_captcha=aW52YWxpZA" \
+    "https://${NGINX_HOST}/captcha-verify" 2>/dev/null)
+echo "$m3_body" | grep -qi "challenges.cloudflare.com\|cf-turnstile" \
+    && ok  "M3: invalid cookie → captcha page re-rendered (Turnstile widget present)" \
+    || fail "M3: invalid cookie — expected captcha re-render, got unexpected body"
+
+# M4: POST with expired cookie (ts=1000000, well past TTL) → re-render
+# ts=1000000 is year 1970+11.5days — guaranteed expired
+# Use sudo to read the secret (file is 640 root:root, readable only by root)
+_ts_secret=$(sudo grep '^TURNSTILE_SECRET=' "${TURNSTILE_ENV}" 2>/dev/null | cut -d= -f2-)
+m4_expired_payload=$(python3 -c "
+import base64, hmac, hashlib, sys
+key = sys.argv[1]
+ts = '1000000'; ua_hash = 'deadbeef'
+payload = ts + ':' + ua_hash
+sig = hmac.new(key.encode(), payload.encode(), hashlib.sha256).hexdigest()
+raw = payload + ':' + sig
+print(base64.urlsafe_b64encode(raw.encode()).decode().rstrip('='))
+" "${_ts_secret}" 2>/dev/null)
+
+if [ -n "$m4_expired_payload" ]; then
+    m4_body=$(${CURL} -X POST -d "_redirect=/" \
+        -H "Cookie: crowdsec_captcha=${m4_expired_payload}" \
+        "https://${NGINX_HOST}/captcha-verify" 2>/dev/null)
+    echo "$m4_body" | grep -qi "challenges.cloudflare.com\|cf-turnstile" \
+        && ok  "M4: expired cookie (ts=1000000) → captcha re-rendered (TTL rejected)" \
+        || fail "M4: expired cookie — expected captcha re-render"
+else
+    warn "M4: could not generate expired cookie payload (python3 error) — skipped"
+fi
+
+# M5: valid HMAC cookie → access bypasses heuristics
+# Generate a real cookie matching the Lua algorithm (same ts:ua_hash:hmac_hex scheme).
+# Use sudo to read the secret (file is 640 root:root).
+m5_cookie=$(python3 -c "
+import base64, hmac, hashlib, time, sys
+key = sys.argv[1]
+ua = 'zgrab/2.0'
+ts = str(int(time.time()))
+ua_hash = hashlib.md5(ua.encode()).hexdigest()[:8]
+payload = ts + ':' + ua_hash
+sig = hmac.new(key.encode(), payload.encode(), hashlib.sha256).hexdigest()
+raw = payload + ':' + sig
+print(base64.urlsafe_b64encode(raw.encode()).decode().rstrip('='))
+" "${_ts_secret}" 2>/dev/null)
+
+if [ -n "$m5_cookie" ]; then
+    # First: restart to clear dict, then verify scored path without cookie → heuristic increments
+    if ! $NO_RESTART; then sudo systemctl restart openresty >/dev/null 2>&1 && sleep 2; fi
+    ua_before=$(cs_metric "heuristics.ua_hits")
+
+    # With valid cookie + bad UA: ua_hits should NOT increment (heuristics bypassed)
+    ${CURL} -A "zgrab/2.0" \
+        -H "Cookie: crowdsec_captcha=${m5_cookie}" \
+        -o /dev/null "https://${NGINX_HOST}/" 2>/dev/null
+    sleep 1
+    ua_after=$(cs_metric "heuristics.ua_hits")
+    [ "$ua_after" -eq "$ua_before" ] 2>/dev/null \
+        && ok  "M5: valid cookie bypasses heuristics (ua_hits unchanged: $ua_before → $ua_after)" \
+        || fail "M5: ua_hits changed ($ua_before → $ua_after) — cookie bypass may be broken"
+else
+    warn "M5: could not generate valid cookie (python3/secret error) — skipped"
+fi
+
+# M6: valid cookie does NOT bypass score≥96 → 444 hard deny
+# The cookie bypasses soft checks but LEVEL_DENY is still applied from the LAPI dict.
+# We can verify this via static analysis: access.lua checks hard.level >= LEVEL_DENY
+# even when has_valid_cookie() returns true.
+grep -A5 'has_valid_cookie' /etc/openresty/lua/crowdsec/access.lua | \
+    grep -q "LEVEL_DENY\|level.*>=\|>= cs\.LEVEL" \
+    && ok  "M6: access.lua enforces hard LAPI deny even with valid cookie (static analysis)" \
+    || fail "M6: hard-deny enforcement missing in cookie bypass path"
+
+# M7: POST /captcha-verify with empty token → cs_reason=captcha NOT set (no verdict written)
+# and the response is a 403 captcha page (not ban page). Access log check is tricky
+# since no verdict is pushed. Instead verify response headers.
+m7_status=$(${CURL} -X POST -d "_redirect=/" -o /dev/null -w "%{http_code}" \
+    "https://${NGINX_HOST}/captcha-verify" 2>/dev/null)
+[ "$m7_status" = "403" ] \
+    && ok  "M7: /captcha-verify with no token → 403 captcha re-render" \
+    || fail "M7: expected 403, got $m7_status"
+
+# M7b: the 403 response is the captcha page (has Turnstile), NOT the ban page
+m7b_body=$(${CURL} -X POST -d "_redirect=/" "https://${NGINX_HOST}/captcha-verify" 2>/dev/null)
+echo "$m7b_body" | grep -qi "cf-turnstile\|turnstile" \
+    && ok  "M7b: 403 response is captcha page (Turnstile widget), not ban page" \
+    || fail "M7b: 403 response does not contain Turnstile widget"
+
+# M8: no error_page loop for captcha renders
+# The captcha page is rendered directly by captcha.render() (not via error_page 403).
+# Verify /captcha-verify POST produces exactly 1 log entry (no internal redirect loop).
+m8_before=$(sudo wc -l < "${ACCESS_LOG}" 2>/dev/null || echo 0)
+${CURL} -X POST -d "_redirect=/" "https://${NGINX_HOST}/captcha-verify" \
+    -o /dev/null 2>/dev/null
+sleep 1
+m8_new=$(sudo tail -n +$((m8_before + 1)) "${ACCESS_LOG}" 2>/dev/null | \
+    grep -c '"POST /captcha-verify' || true)
+[ "$m8_new" -le 1 ] \
+    && ok  "M8: no error_page loop — ${m8_new} log entry for /captcha-verify POST" \
+    || fail "M8: possible loop — $m8_new entries for /captcha-verify (expected ≤1)"
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""

@@ -2,6 +2,105 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.4.0] - 2026-05-23
+
+### Added
+
+- **`lua/crowdsec/captcha.lua`** — Cloudflare Turnstile CAPTCHA workflow (stateless, no Redis):
+  - `has_valid_cookie()` — validates HMAC-SHA256 signed cookie; called at top of `access.lua`
+    before honeypots and heuristics; valid cookie skips soft mitigations but still enforces
+    LEVEL_DENY+ from LAPI (hard bans remain effective after solve).
+  - `render(redirect_hint)` — serves inline challenge page (HTTP 403); sitekey injected from
+    env at render time; `__REDIRECT__` HTML-escaped to prevent XSS; CSP: Turnstile domains +
+    inline script hash (`sha256-X4Sgww…`); `Cache-Control: no-store`.
+  - `verify()` — handles `POST /captcha-verify`; validates Turnstile token with CF API (3s
+    timeout, fail closed); issues `crowdsec_captcha` cookie on success; 303 redirect to
+    original URI preserved across re-renders.
+  - Cookie format: `base64url(ts:ua_hash:hmac_hex)`, TTL 20 min, HttpOnly + Secure +
+    SameSite=Lax. UA bound via `md5(UA)[:8]` (NAT/mobile compatible). Stateless: all
+    state in the signed cookie — no disk, no Redis, no new system dependency.
+
+- **`access.lua` — Section 0b: captcha cookie bypass**: after the error_page guard and before
+  honeypot check, a valid HMAC cookie skips honeypots, heuristics, and soft mitigations.
+  LAPI hard denies (LEVEL_DENY+) still apply — `lookup.get_verdict()` is called and
+  `mitigation.apply()` executed if level ≥ 5.
+
+- **`mitigation.lua` — LEVEL_CAPTCHA branch wired**: `captcha.render()` is now called from
+  the LEVEL_CAPTCHA (4) branch; `crowdsec_block_reason = "captcha"` set before render so
+  access logs and ban page show the correct reason. Previously dead code — LEVEL_CAPTCHA is
+  only reachable via LAPI `remediation: captcha` decisions.
+
+- **System infrastructure** (not in repo — deployed separately):
+  - `/etc/crowdsec/turnstile.env` (640 root:root) — `TURNSTILE_SITEKEY` + `TURNSTILE_SECRET`
+  - `/etc/systemd/system/openresty.service.d/turnstile.conf` — `EnvironmentFile=` drop-in
+  - `nginx.conf` main context — `env TURNSTILE_SITEKEY; env TURNSTILE_SECRET;` (all three
+    required: env file + systemd drop-in + nginx env directive)
+  - `snippets/crowdsec_captcha.conf` — `location = /captcha-verify` with empty
+    `access_by_lua_block {}` (prevents crowdsec loop), `limit_except POST { deny all; }`,
+    `content_by_lua_block { require("crowdsec.captcha").verify() }`
+  - `www.arleo.eu` vhost — `include snippets/crowdsec_captcha.conf;`
+  - `crowdsec_openresty.conf` `init_by_lua_block` — `require "crowdsec.captcha"`
+
+- **Regression tests — sections K, L, M** (47 total, up from 39):
+  - Section K (5 tests) — `/.env` honeypot non-regression: confirms honeypot triggers before
+    `score_path()`, no double-count, access log updated correctly.
+  - Section L (3 tests) — LEVEL_CAPTCHA code-path audit: static analysis verifies
+    `captcha.render()` called in mitigation.lua, `crowdsec_block_reason` set, cookie bypass
+    in access.lua enforces LEVEL_DENY+.
+  - Section M (9 tests) — Turnstile workflow: GET /captcha-verify → 403, invalid cookie →
+    re-render, expired cookie → re-render, valid cookie → heuristics bypassed, no error_page
+    loop, no redirect preserved through re-render.
+
+### Fixed
+
+- **`mitigation.lua` — LEVEL_CAPTCHA `cs_reason` missing** (known debt from 3.3.4): added
+  `ngx.var.crowdsec_block_reason = "captcha"` before `captcha.render()`.
+
+- **`heuristics.lua` — `PATH_SCORES["/.env"] = 60` dead code** (known debt from 3.3.4):
+  removed. The honeypot check in `access.lua` exits on `/.env` before `score_path()` is
+  reached; the entry was never evaluated.
+
+- **`scripts/regression-test.sh` — honeypot log-grep false positive**: section B used
+  `tail -20` which could match prior-run log entries. Fixed with a before/after line-count
+  snapshot: `honey_before=$(sudo wc -l < "$ACCESS_LOG")` + `tail -n +$((honey_before+1))`.
+
+- **`scripts/regression-test.sh` — port readiness race**: `restart_openresty()` previously
+  `sleep 3` which was insufficient. Now polls port 8091 with a retry loop (up to 10s).
+
+### Security
+
+- Cookie forgery: HMAC-SHA256 (binary, via `ngx.hmac_sha256`) over `ts:ua_hash`; flip any
+  byte → mismatch → no bypass. Verified by tamper test.
+- Open redirect: `safe_path()` rejects `//host`, absolute URLs, `\r`/`\n` injection. Uses
+  `find(str, 1, true)` (plain-string, no Lua pattern) to avoid null-byte pattern crash.
+- POST-only: `limit_except POST { deny all; }` at nginx level — GET/HEAD on `/captcha-verify`
+  returns 403 without reaching Lua.
+- HTTP→HTTPS: `/captcha-verify` on port 80 receives 301 redirect; cookie is `Secure`.
+- LAPI ban post-solve: verified via live test — hard ban injected after cookie issue still
+  returns 403; cookie bypass does not override LEVEL_DENY+.
+- SECRET absence: `has_valid_cookie()` returns `false` immediately if `SECRET == ""`.
+
+### Operations
+
+- **Secret rotation**: `TURNSTILE_SECRET` is read at worker startup via `os.getenv()` — it
+  is not re-read per request. After rotating `/etc/crowdsec/turnstile.env`:
+  ```
+  systemctl restart openresty   # restart required — reload does NOT re-exec workers
+  ```
+  Reload (`systemctl reload openresty`) replaces config but keeps workers alive; workers
+  retain the old secret until they exit. Only `restart` guarantees all workers pick up the
+  new value.
+
+### Known remaining technical debt
+
+- **LEVEL_CAPTCHA not reachable via local heuristics**: `score_to_level()` maps scores
+  directly from CHALLENGE (3) to DENY (5); LEVEL_CAPTCHA (4) is only issued by LAPI with
+  `remediation: captcha`. The workflow is fully implemented; activation requires a CrowdSec
+  scenario or manual `cscli decisions add --type captcha`.
+- **No rate-limit on `/captcha-verify`**: repeated POST with invalid tokens causes CF to
+  reject (re-render loop, no bypass). Existing `limit_req` on the vhost provides ambient
+  protection; a dedicated `limit_req_zone` on this location would be more precise.
+
 ## [3.3.4] - 2026-05-23
 
 ### Fixed

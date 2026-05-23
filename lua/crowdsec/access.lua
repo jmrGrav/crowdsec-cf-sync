@@ -4,6 +4,8 @@
   Called from access_by_lua_block in every vhost.
   Decision path (in order):
 
+    0. Internal guards  → crowdsec_error_page loop prevention
+    0b. Captcha cookie  → if valid, enforce hard LAPI denies then allow
     1. Honeypot check   → instant deny + escalation event
     2. Deadman check    → if sync stale, suspend soft mitigations
     3. Verdict lookup   → shared dict only, O(1)
@@ -55,6 +57,19 @@ function M.check()
         -- Bypasses honeypot scoring, header anomaly scoring, and heuristic-only denies.
         -- LAPI-pushed verdicts (source="p") still apply — this is NOT a security bypass.
         local skip_heuristics = ngx.var.crowdsec_skip_heuristics == "1"
+
+        -- ── 0b. Captcha cookie bypass ─────────────────────────────────────────
+        -- A valid HMAC-signed cookie means the client already passed Turnstile.
+        -- Skip honeypots, heuristics, and soft mitigations — but still enforce
+        -- LAPI hard denies (LEVEL_DENY+) so post-solve bans remain effective.
+        local captcha = require "crowdsec.captcha"
+        if captcha.has_valid_cookie() then
+            local hard = lookup.get_verdict(ip)
+            if hard and hard.level >= cs.LEVEL_DENY then
+                mitigation.apply(hard, ip)
+            end
+            return
+        end
 
         -- ── 1. Honeypot ───────────────────────────────────────────────────────
         if not skip_heuristics and heuristics.is_honeypot(uri) then
