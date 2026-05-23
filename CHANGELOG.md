@@ -2,6 +2,74 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.3.4] - 2026-05-23
+
+### Fixed
+
+- **heuristics.lua — 4 broken path patterns** (`path:find("%.env", 1, true)` and 3 others):
+  the `true` flag (plain-string search) caused the Lua `%`-escape sequences to be searched
+  literally, so `/backup/.env`, `/.git/HEAD`, `/wp-admin/options.php`, and `*.php~` all scored
+  0 instead of 60 / 40 / 20 / 40. Removed the `true` flag; patterns now use Lua pattern
+  matching as intended (`"%.env"` = literal `.env`, `"wp%-admin"` = `wp-admin`).
+
+- **access.lua — error_page 403 infinite loop**: adding `error_page 403 /crowdsec-ban-page`
+  without a guard caused heuristic-banned IPs to trigger a recursive
+  `access → error_page → access → 403 → …` cycle. Fixed with a `$crowdsec_error_page`
+  nginx variable set in the internal location's rewrite phase; `access.lua` returns
+  immediately when it reads `"1"`, breaking the loop cleanly.
+
+- **access.lua — monitoring bypass (`$crowdsec_skip_heuristics`)**: BetterStack probes
+  hitting `/ping` accumulated heuristic score due to scanner-like UA, missing
+  `Accept-Language`, etc. Setting `set $crowdsec_skip_heuristics 1;` in the `/ping` location
+  bypasses honeypot, UA, header, and path scoring while preserving LAPI-pushed bans.
+
+- **mitigation.lua — cs_reason for heuristic denies**: LEVEL_DENY exits from heuristic
+  verdicts (score 81–95) logged `cs_reason=-` in the access log and showed "block" on the
+  ban page. Now sets `ngx.var.crowdsec_block_reason = "heuristic"` (guarded by
+  `verdict.source == "h"`) before `ngx.exit(403)`.
+
+- **Vector pipeline — CAPI + crowdsec engine decisions**: `crowdsec_decisions_filter`
+  only matched `origin == "cscli"`, silently dropping CAPI (≈100 entries/day) and
+  crowdsec engine decisions (≈12). Filter extended to `cscli || crowdsec || CAPI`.
+
+### Added
+
+- **`snippets/crowdsec_ban_page.conf`** — universal ban page snippet: `error_page 403
+  /crowdsec-ban-page` with an `internal` content handler that renders `ban.html` for all
+  403 sources (heuristic deny, nginx `deny all`, `return 403`). AppSec + LAPI bans already
+  write their own body before `ngx.exit(403)` and are unaffected.
+
+- **`scripts/regression-test.sh`** — 31-test non-regression suite (exit 1 on failure).
+  Sections: /ping bypass (6 tests), honeypot ban page (4), heuristic ban page (4), silent
+  drop 444 (1), nginx deny ban page (2), ban page headers (6), heuristics path scoring
+  (25 Lua cases), Vector pipeline (2), shared dict / IPC sanity (2), monitoring endpoints
+  (3). Usage: `sudo -u jm -E bash scripts/regression-test.sh`.
+
+- **`docs/HARDENING_REPORT_V3.3.4.md`** — pre-release hardening report: full architecture
+  diagram, exact error_page / skip_heuristics / cs_reason flows, performance results
+  (300 req × 2 scenarios, stable memory, 0 Lua errors), all-locations security audit,
+  remaining technical debt, and pre-release checklist.
+
+### Changed
+
+- **`docs/runtime-layout.md`** — corrected "dual path" section: `/etc/openresty` is a
+  system symlink to `/usr/local/openresty/nginx/conf`; there is one physical Lua directory,
+  not two. Documents the circular-symlink trap explicitly.
+
+- **`scripts/release-v3.sh`** — removed `luac -p` syntax check: `luac` 5.1 rejects valid
+  LuaJIT `goto` statements in `sync.lua` (false positive). `openresty -t` is the
+  authoritative validator.
+
+### Known remaining technical debt
+
+- **LEVEL_CAPTCHA `cs_reason`**: the captcha branch of `mitigation.lua` does not set
+  `ngx.var.crowdsec_block_reason`. No production hits currently; one-line fix deferred to
+  avoid scope creep.
+- **`PATH_SCORES["/.env"] = 60`**: dead code — the honeypot check exits before
+  `score_path()` is reached for the exact path `/.env`. Cosmetic only, no functional impact.
+- **`luac` 5.1 false positive**: `sync.lua` uses `goto` (valid LuaJIT) which standard
+  `luac` 5.1 rejects. Use `openresty -t` for all Lua syntax validation, not `luac`.
+
 ## [3.2.0] - 2026-05-22
 
 ### Added
