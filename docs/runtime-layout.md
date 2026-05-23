@@ -46,12 +46,20 @@ Health / metrics port: `127.0.0.1:8765` (`/health`, `/metrics`).
   tarpit.lua      # tarpit sleep implementation
 ```
 
-On dual-path installs (OpenResty from package + from source), files are mirrored:
+**Single physical directory — no mirroring required:**
+
+On this installation `/etc/openresty` is a system symlink to `/usr/local/openresty/nginx/conf`.
+Both paths therefore resolve to the same physical directory:
+
 ```
-/usr/local/openresty/nginx/conf/lua/crowdsec/   (same files)
+/usr/local/openresty/nginx/conf/lua/crowdsec/  ← physical directory
+/etc/openresty/lua/crowdsec/                   ← alias via /etc/openresty symlink
 ```
 
-The `lua_package_path` in `crowdsec_openresty.conf` controls which path is searched first.
+Do NOT create an additional symlink between these two paths — it produces a circular reference.
+Deploy Lua files once to either path; both reflect the change immediately.
+
+The `lua_package_path` in `crowdsec_openresty.conf` references `/etc/openresty/lua/?.lua`.
 
 ## OpenResty configuration files
 

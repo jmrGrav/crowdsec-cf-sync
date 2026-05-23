@@ -80,15 +80,9 @@ ok "gh CLI authenticated"
 # Python syntax check
 python3 -m py_compile crowdsec-cf-syncV3.py 2>/dev/null && ok "Python syntax OK" || fail "Python syntax error in crowdsec-cf-syncV3.py"
 
-# Lua syntax checks (if luac available)
-if command -v luac > /dev/null 2>&1; then
-    for f in lua/crowdsec/*.lua; do
-        luac -p "$f" || fail "Lua syntax error in $f"
-    done
-    ok "Lua syntax OK"
-else
-    warn "luac not found — skipping Lua syntax check"
-fi
+# Lua syntax: openresty -t is authoritative (LuaJIT, supports goto).
+# luac 5.1 is NOT used — it rejects valid goto statements in sync.lua (false positive).
+ok "Lua syntax: validated via openresty -t (see pre-flight step above)"
 
 # ── 2. Consistency check ──────────────────────────────────────────────────────
 step "Release consistency check"

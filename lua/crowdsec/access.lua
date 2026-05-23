@@ -40,13 +40,24 @@ function M.check()
         local ip = ngx.var.remote_addr
         if not ip or ip == "" then return end
 
+        -- crowdsec_error_page=1 is set by the /crowdsec-ban-page internal location.
+        -- Skipping here prevents an access→error_page→access loop: when an IP is
+        -- heuristic-banned and error_page redirects to /crowdsec-ban-page, this
+        -- guard lets the error page render without re-triggering a 403.
+        if ngx.var.crowdsec_error_page == "1" then return end
+
         cs.metrics:incr("total_checks", 1, 0)
 
         local uri    = ngx.var.request_uri or "/"
         local method = ngx.req.get_method()
 
+        -- skip_heuristics: set via $crowdsec_skip_heuristics=1 in nginx location block.
+        -- Bypasses honeypot scoring, header anomaly scoring, and heuristic-only denies.
+        -- LAPI-pushed verdicts (source="p") still apply — this is NOT a security bypass.
+        local skip_heuristics = ngx.var.crowdsec_skip_heuristics == "1"
+
         -- ── 1. Honeypot ───────────────────────────────────────────────────────
-        if heuristics.is_honeypot(uri) then
+        if not skip_heuristics and heuristics.is_honeypot(uri) then
             cs.metrics:incr("honeypot_hits", 1, 0)
             local verdict = lookup.add_heuristic_score(ip, 100, 3600)
             events.write("honeypot_hit", ip, verdict and verdict.score or 100, uri)
@@ -74,7 +85,7 @@ function M.check()
         -- ── 4. Local heuristics (suspended when stale or under memory pressure) ──
         -- Skip when stale: avoids false-positives from outdated scoring.
         -- Skip when memory pressure: avoids writing new entries to a nearly-full dict.
-        if not stale and not mem_pressure then
+        if not stale and not mem_pressure and not skip_heuristics then
             local hdrs = ngx.req.get_headers(50, true)
             local delta = heuristics.score_request(ip, uri, method, hdrs)
 
@@ -91,6 +102,8 @@ function M.check()
             if stale and verdict.level < cs.LEVEL_DENY then
                 return  -- soft verdicts (tarpit/challenge) suspended in stale mode
             end
+            -- skip_heuristics: do not enforce heuristic-only verdicts (monitoring paths)
+            if skip_heuristics and verdict.source == "h" then return end
             mitigation.apply(verdict, ip)
         end
 

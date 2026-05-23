@@ -73,6 +73,12 @@ function M.apply(verdict, ip)
             -- 444 = silent drop (nginx extension); no response sent
             ngx.exit(444)
         else
+            -- Heuristic-sourced denies: label the reason so the ban page and
+            -- access log show "heuristic" instead of the map's default "-".
+            -- LAPI bans (source="p") keep "-" → shown as "block" on the ban page.
+            if verdict.source == "h" then
+                ngx.var.crowdsec_block_reason = "heuristic"
+            end
             ngx.exit(ngx.HTTP_FORBIDDEN)
         end
     end

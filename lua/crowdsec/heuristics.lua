@@ -96,15 +96,17 @@ local function score_path(uri)
     local exact = PATH_SCORES[path]
     if exact then return exact end
 
-    -- Prefix / substring checks (ordered cheapest-first)
-    if path:find("%.env",    1, true) then return 60 end
-    if path:find("%.git",    1, true) then return 40 end
-    if path:find("phpunit",  1, true) then return 60 end
-    if path:find("wp%-admin",1, true) then return 20 end
-    if path:find("phpmyadmin",1, true)then return 20 end
-    if path:find("%.php~",   1, true) then return 40 end  -- backup PHP files
-    if path:find("passwd",   1, true) then return 50 end
-    if path:find("shadow",   1, true) then return 50 end
+    -- Prefix / substring checks (ordered cheapest-first).
+    -- Note: patterns use Lua pattern syntax (no plain=true flag), so % escapes
+    -- special chars: "%.env" matches literal ".env", "wp%-admin" matches "wp-admin".
+    if path:find("%.env",     1) then return 60 end
+    if path:find("%.git",     1) then return 40 end
+    if path:find("phpunit",   1, true) then return 60 end
+    if path:find("wp%-admin", 1) then return 20 end
+    if path:find("phpmyadmin",1, true) then return 20 end
+    if path:find("%.php~",    1) then return 40 end  -- backup PHP files
+    if path:find("passwd",    1, true) then return 50 end
+    if path:find("shadow",    1, true) then return 50 end
 
     return 0
 end
