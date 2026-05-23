@@ -41,8 +41,12 @@ local HONEYPOT = {
 }
 
 -- ── Sensitive paths (scored but not instant-deny) ─────────────────────────────
+-- NOTE: honeypots in HONEYPOT{} are evaluated BEFORE score_path() is ever called
+-- (access.lua exits via ngx.exit at step 1 if is_honeypot() returns true).
+-- Do NOT add exact honeypot paths here — they would be unreachable dead code.
 local PATH_SCORES = {
-    ["/.env"]          = 60,
+    -- ["/.env"] intentionally absent: /.env is a HONEYPOT path (exact match).
+    -- Subpaths like /backup/.env are caught by the "%.env" pattern below.
     ["/.git"]          = 40,
     ["/wp-login.php"]  = 25,
     ["/wp-admin"]      = 20,

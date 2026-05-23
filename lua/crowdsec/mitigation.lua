@@ -64,6 +64,7 @@ function M.apply(verdict, ip)
     -- ── Level 4: CAPTCHA ──────────────────────────────────────────────────────
     elseif level == cs.LEVEL_CAPTCHA then
         cs.metrics:incr("captchas", 1, 0)
+        ngx.var.crowdsec_block_reason = "captcha"
         ngx.exit(ngx.HTTP_FORBIDDEN)
 
     -- ── Level 5+: hard deny ───────────────────────────────────────────────────
