@@ -2888,14 +2888,22 @@ def main() -> None:
 
 if __name__ == "__main__":
     # ── Subcommand dispatch ────────────────────────────────────────────────────
-    # Usage:
-    #   crowdsec-cf-sync               — run daemon (default)
-    #   crowdsec-cf-sync doctor        — system health audit
-    #   crowdsec-cf-sync wal inspect   — inspect WAL
-    #   crowdsec-cf-sync wal replay    — dry-run WAL replay
-    #   crowdsec-cf-sync wal replay --execute  — execute WAL replay
-    #   crowdsec-cf-sync wal compact   — compact WAL to net state
+    # Usage examples are built at runtime from sys.argv[0] so renames of the
+    # executable don't silently drift away from the doc.
+    _prog = Path(sys.argv[0]).name or "crowdsec-cf-sync"
+    _USAGE = "\n".join((
+        f"  {_prog}                            — run daemon (default)",
+        f"  {_prog} doctor                     — system health audit",
+        f"  {_prog} wal inspect                — inspect WAL",
+        f"  {_prog} wal replay                 — dry-run WAL replay",
+        f"  {_prog} wal replay --execute       — execute WAL replay",
+        f"  {_prog} wal compact                — compact WAL to net state",
+    ))
     args = sys.argv[1:]
+    if args and args[0] in ("-h", "--help", "help"):
+        print("Usage:")
+        print(_USAGE)
+        sys.exit(0)
     if args and args[0] == "doctor":
         sys.exit(cmd_doctor())
     elif args and args[0] == "wal":
@@ -2907,7 +2915,7 @@ if __name__ == "__main__":
         elif sub == "compact":
             cmd_wal_compact()
         else:
-            print("Usage: wal <inspect|replay|compact>")
+            print(f"Usage: {_prog} wal <inspect|replay|compact>")
             sys.exit(1)
     else:
         main()
