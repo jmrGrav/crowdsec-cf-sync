@@ -199,14 +199,14 @@ Ordre **non négociable** :
 5. ✅ Golden tests WAL (32 tests) (DONE 2026-05-24)
 5b. ✅ Prod-pattern fixtures + corruption variants (+18 tests) (DONE 2026-05-24)
 6. ✅ F3 — StateStore (extraction load_X/save_X) in-file class (DONE 2026-05-24, branch refactor/state-store-extraction)
-7. ⏳ F7 — Models (dataclass/TypedDict, sérialisation préservée)  ← NEXT
-8. ⏳ F1 phases 1-4 — Safe Extraction (move StateStore to state_store.py + wal.py + models.py + config.py — true package layout)
+7. ✅ F7 — Models (dataclass/TypedDict, sérialisation préservée) (DONE 2026-05-24, commit 3f152c0)
+8. ⏳ F1 phases 1-4 — Safe Extraction (move StateStore to state_store.py + wal.py + models.py + config.py — true package layout)  ← NEXT
 9. ⏳ F1 phase 5 + F2 + F6 — Supervisor class
 10. ⏳ F1 phase 6 + F5 — Pipeline explicite
 11. ⏳ F4 — IPC Contract formalisé (JSON Schema files)
 ```
 
-**Tests :** `scripts/test-python.sh` (stdlib unittest, hermétiques, ~0.5s pour 86 tests).
+**Tests :** `scripts/test-python.sh` (stdlib unittest, hermétiques, ~0.5s pour 104 tests).
 Couverture actuelle : envelope, atomic write, checksum, V3 backward compat, 6 domain
 load/save, .bak policy, mutation safety, WAL init/log/trim/replay/inspect, malformed
 line tolerance, restart-cross monotonic ids.
