@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "lua-events.schema.json",
+  "title": "LuaEventEntry",
+  "description": "One line in LUA_EVENTS_FILE (default /run/crowdsec-lua/events.jsonl). Written by the OpenResty Lua layer, consumed by read_lua_events() + process_lua_events() in Python. The file is consumed atomically via rename (events.jsonl → events.jsonl.processing); Lua recreates it after the rename. Malformed lines are silently skipped.",
+  "type": "object",
+  "required": ["type", "ip", "score"],
+  "properties": {
+    "type": {
+      "type": "string",
+      "enum": ["honeypot_hit", "heuristic_escalate"],
+      "description": "Event type. 'honeypot_hit': request to a honeypot path. 'heuristic_escalate': Lua score threshold exceeded."
+    },
+    "ip": {
+      "type": "string",
+      "description": "Client IPv4 or IPv6 address. Empty or missing entries are silently dropped by process_lua_events()."
+    },
+    "score": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 100,
+      "description": "Lua-computed threat score. For 'heuristic_escalate', AbuseIPDB report is sent only when score >= 90."
+    },
+    "detail": {
+      "type": "string",
+      "description": "Optional human-readable detail (e.g. honeypot path, matched rule). Included in AbuseIPDB comment."
+    }
+  },
+  "additionalProperties": true
+}
