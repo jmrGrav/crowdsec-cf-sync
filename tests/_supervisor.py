@@ -23,7 +23,7 @@ import logging.handlers
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
-_SUPERVISOR_PATH = _REPO_ROOT / "crowdsec-cf-sync"
+_SUPERVISOR_PATH = _REPO_ROOT / "crowdsec_cf_sync" / "main.py"
 
 # Singleton: load the supervisor at most once across the whole test run.
 # Each test file does `sup = load_supervisor()` at module-level; without
