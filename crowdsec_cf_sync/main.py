@@ -2371,6 +2371,33 @@ def cmd_doctor() -> int:
         return 2
 
 
+def _sync_crowdsec_sources(
+    reported: dict,
+    recidivists: dict,
+    modsec_state: dict,
+    cidr_state: dict,
+    bouncer_check_state: dict,
+    cs_allowlist: List[str],
+) -> tuple:
+    sync_cloudflare(cs_allowlist)
+
+    if not _shutdown.is_set():
+        reported = sync_abuseipdb(reported)
+    if not _shutdown.is_set():
+        recidivists = sync_recidivists(recidivists)
+    if not _shutdown.is_set():
+        modsec_state, reported = sync_modsec(modsec_state, cs_allowlist, reported)
+    if not _shutdown.is_set():
+        cleanup_modsec_cf_rules(modsec_state)
+    if not _shutdown.is_set():
+        cidr_state = sync_cidr_bans(cidr_state, cs_allowlist)
+    if not _shutdown.is_set():
+        bouncer_check_state = sync_bouncer_abuseipdb(bouncer_check_state, cs_allowlist)
+
+    recidivists = purge_old_recidivists(recidivists)
+    return (reported, recidivists, modsec_state, cidr_state, bouncer_check_state)
+
+
 def _ingest_lua_events(reported: dict, cs_allowlist: List[str]) -> dict:
     # Atomic rename avoids read-truncate race with Lua append.
     if LUA_ENABLED and not _shutdown.is_set():
@@ -2520,22 +2547,12 @@ def main() -> None:
             # ── Lua event ingestion (start of cycle) ──────────────────────────
             reported = _ingest_lua_events(reported, cs_allowlist)
 
-            sync_cloudflare(cs_allowlist)
-
-            if not _shutdown.is_set():
-                reported = sync_abuseipdb(reported)
-            if not _shutdown.is_set():
-                recidivists = sync_recidivists(recidivists)
-            if not _shutdown.is_set():
-                modsec_state, reported = sync_modsec(modsec_state, cs_allowlist, reported)
-            if not _shutdown.is_set():
-                cleanup_modsec_cf_rules(modsec_state)
-            if not _shutdown.is_set():
-                cidr_state = sync_cidr_bans(cidr_state, cs_allowlist)
-            if not _shutdown.is_set():
-                bouncer_check_state = sync_bouncer_abuseipdb(bouncer_check_state, cs_allowlist)
-
-            recidivists = purge_old_recidivists(recidivists)
+            (
+                reported, recidivists, modsec_state, cidr_state, bouncer_check_state,
+            ) = _sync_crowdsec_sources(
+                reported, recidivists, modsec_state, cidr_state, bouncer_check_state,
+                cs_allowlist,
+            )
 
             # ── Lua state push (after all local state is up to date) ──────────
             if LUA_ENABLED and not _shutdown.is_set():
