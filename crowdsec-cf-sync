@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 # Thin launcher — delegates entirely to crowdsec_cf_sync.main.
-# The package directory lives next to this script in both dev and prod,
-# so no install step is needed.
+# Dev: package lives next to this script (editable).
+# Prod: package deployed to /usr/local/lib/crowdsec-cf-sync/.
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+_here = Path(__file__).resolve().parent
+_lib  = Path("/usr/local/lib/crowdsec-cf-sync")
+for _p in (_lib, _here):
+    if (_p / "crowdsec_cf_sync").is_dir():
+        sys.path.insert(0, str(_p))
+        break
 
 from crowdsec_cf_sync.main import run
 run()
