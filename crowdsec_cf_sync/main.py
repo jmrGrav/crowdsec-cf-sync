@@ -2371,6 +2371,17 @@ def cmd_doctor() -> int:
         return 2
 
 
+def _update_health_state(cs_allowlist: List[str], recidivists: dict, cidr_state: dict) -> None:
+    with _health_lock:
+        _health_state.update(
+            _build_health(
+                cs_allowlist_size=len(cs_allowlist),
+                recidivists_size=len([k for k in recidivists if not k.startswith("_")]),
+                cidr_size=len(cidr_state),
+            )
+        )
+
+
 def _run_reconciliation_if_due(
     cs_allowlist: List[str],
     last_reconcile: float,
@@ -2626,14 +2637,7 @@ def main() -> None:
         log.debug("Cycle %d terminé en %.1fs", loop_count, elapsed)
 
         # Update health endpoint state
-        with _health_lock:
-            _health_state.update(
-                _build_health(
-                    cs_allowlist_size=len(cs_allowlist),
-                    recidivists_size=len([k for k in recidivists if not k.startswith("_")]),
-                    cidr_size=len(cidr_state),
-                )
-            )
+        _update_health_state(cs_allowlist, recidivists, cidr_state)
 
         _sd_notify(f"WATCHDOG=1\nSTATUS=Cycle {loop_count} OK\n")
 
