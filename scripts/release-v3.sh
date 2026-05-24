@@ -78,7 +78,7 @@ fi
 ok "gh CLI authenticated"
 
 # Python syntax check
-python3 -m py_compile crowdsec-cf-syncV3.py 2>/dev/null && ok "Python syntax OK" || fail "Python syntax error in crowdsec-cf-syncV3.py"
+python3 -m py_compile crowdsec-cf-sync 2>/dev/null && ok "Python syntax OK" || fail "Python syntax error in crowdsec-cf-sync"
 
 # Lua syntax: openresty -t is authoritative (LuaJIT, supports goto).
 # luac 5.1 is NOT used — it rejects valid goto statements in sync.lua (false positive).

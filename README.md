@@ -6,7 +6,7 @@ One active script; previous versions archived:
 
 | File | Version | Status |
 |---|---|---|
-| `crowdsec-cf-syncV3.py` | **3.2.0** — recommended | Active, production-ready |
+| `crowdsec-cf-sync` | **3.6.0** — current | Active, production-ready |
 | `archived/crowdsec-cf-syncV2.py` | 2.0.0 | Archived, kept for reference |
 | `archived/crowdsec-cf-sync.py` | 1.0.0 | Archived, kept for reference |
 
@@ -227,7 +227,7 @@ Wants=crowdsec.service
 [Service]
 EnvironmentFile=/etc/crowdsec/cf-sync.env
 Type=notify
-ExecStart=/usr/bin/python3 /usr/local/bin/crowdsec-cf-syncV3.py
+ExecStart=/usr/local/bin/crowdsec-cf-sync
 Restart=always
 RestartSec=10
 WatchdogSec=120

@@ -8,7 +8,7 @@ Two independent processes cooperate via a shared filesystem IPC. The Python daem
 ┌─────────────────────────────────────────────────────────────────────┐
 │                        CONTROL PLANE (Python)                       │
 │                                                                     │
-│  crowdsec-cf-syncV3.py — single process, runs as root               │
+│  crowdsec-cf-sync — single process, runs as root               │
 │                                                                     │
 │  ┌─────────────┐   ┌──────────────┐   ┌────────────────────────┐  │
 │  │ CrowdSec    │   │  Cloudflare  │   │  AbuseIPDB / heuristic  │  │

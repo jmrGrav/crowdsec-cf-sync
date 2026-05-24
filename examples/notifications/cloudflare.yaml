@@ -1,0 +1,27 @@
+# CrowdSec notification plugin — Cloudflare event-driven blocker
+# Place in: /etc/crowdsec/notifications/cloudflare.yaml
+# Then add to /etc/crowdsec/profiles.yaml: notifications: [cloudflare_notifier]
+# Requires: crowdsec-notifier.py running on 127.0.0.1:9999
+#
+# Architecture: notifier = hot path (event-driven, <5s latency)
+# crowdsec-cf-sync remains authoritative for expiry cleanup and drift reconciliation
+
+type: http
+name: cloudflare_notifier
+log_level: info
+
+# 5s latency target; threshold=1 ensures single bans are not held in batch
+# Do NOT use threshold=10 here — it silently mutes single-alert bursts
+group_wait: 5s
+group_threshold: 1
+max_retry: 3
+timeout: 15s
+
+# {{.|toJson}} delivers the raw models.Alert array — receiver parses it directly
+format: |
+  {{.|toJson}}
+
+url: http://127.0.0.1:9999/crowdsec/cloudflare
+method: POST
+headers:
+  Content-Type: "application/json"

@@ -6,7 +6,7 @@ Wants=crowdsec.service
 [Service]
 EnvironmentFile=/etc/crowdsec/cf-sync.env
 Type=notify
-ExecStart=/usr/bin/python3 /usr/local/bin/crowdsec-cf-syncV3.py
+ExecStart=/usr/local/bin/crowdsec-cf-sync
 Restart=always
 RestartSec=10
 WatchdogSec=120

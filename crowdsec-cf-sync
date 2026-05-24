@@ -73,6 +73,10 @@ DRY_RUN           = os.environ.get("CF_DRY_RUN", "").lower() in ("1", "true", "y
 HEALTH_PORT       = int(os.environ.get("CF_HEALTH_PORT", "8765"))
 RECONCILE_SECS    = int(os.environ.get("CF_RECONCILE_SECS", "300"))
 CF_MIN_CONFIDENCE = os.environ.get("CF_MIN_CONFIDENCE", "low")
+# When =1, sync_cloudflare() skips the push loop (handled by notifier); keeps expiry cleanup
+CF_NOTIFIER_ACTIVE = os.environ.get("CF_NOTIFIER_ACTIVE", "").lower() in ("1", "true", "yes")
+# When =0, sync_abuseipdb() is disabled (notifier handles AbuseIPDB reporting)
+SYNC_ABUSEIPDB = os.environ.get("SYNC_ABUSEIPDB", "1").lower() not in ("0", "false", "no")
 CB_THRESHOLD      = int(os.environ.get("CF_CB_THRESHOLD", "5"))
 CB_RESET_SECS     = float(os.environ.get("CF_CB_RESET_SECS", "120"))
 
@@ -267,6 +271,7 @@ class _Metrics:
         }
         self._gauges: Dict[str, str] = {
             "last_sync_ts": "",
+            "cf_rule_count": "0",
             "mode":         "dry_run" if DRY_RUN else "normal",
             "uptime_start": datetime.now(timezone.utc).isoformat(),
         }
@@ -698,6 +703,9 @@ def _build_prometheus(snap: Optional[dict] = None) -> str:
         "# HELP crowdsec_cf_sync_wal_entries_total WAL entries written",
         "# TYPE crowdsec_cf_sync_wal_entries_total counter",
         f"crowdsec_cf_sync_wal_entries_total {s.get('wal_entries', 0)}",
+        "# HELP crowdsec_cf_sync_cf_rule_count Current Cloudflare access rules managed by CrowdSec",
+        "# TYPE crowdsec_cf_sync_cf_rule_count gauge",
+        f"crowdsec_cf_sync_cf_rule_count {s.get('cf_rule_count', 0)}",
         "# HELP crowdsec_cf_sync_dry_run 1 if dry-run mode is active",
         "# TYPE crowdsec_cf_sync_dry_run gauge",
         f"crowdsec_cf_sync_dry_run {1 if DRY_RUN else 0}",
@@ -1671,6 +1679,8 @@ def report_to_abuseipdb(ip: str, scenario: str, origin: str, timestamp: str) -> 
 
 
 def sync_abuseipdb(reported: dict) -> dict:
+    if not SYNC_ABUSEIPDB:
+        return reported
     recent_bans = get_recent_local_bans()
     if not recent_bans:
         return reported
@@ -1765,6 +1775,7 @@ def sync_cloudflare(cs_allowlist: Set[str]) -> None:
         log.warning("CF Sync: impossible de lire règles CF — %s", exc)
         return
     cf_blocked = get_cf_blocked_ips(rules=all_rules)
+    metrics.set_gauge("cf_rule_count", str(len(cf_blocked)))
 
     log.info("CF Sync — CrowdSec: %d bans | Cloudflare: %d règles",
              len(clean_bans), len(cf_blocked))
@@ -1775,13 +1786,16 @@ def sync_cloudflare(cs_allowlist: Set[str]) -> None:
     to_add_collapsed = set(collapse_ips(to_add))
 
     added = deleted = 0
-    for ip in to_add_collapsed:
-        if _shutdown.is_set():
-            break
-        if add_cf_rule(ip):
-            added += 1
-            log.info("CF: Ajouté %s", ip)
-        time.sleep(0.1)
+    if CF_NOTIFIER_ACTIVE:
+        log.info("CF Sync: notifier actif -- push deleguee (%d IPs ignorees)", len(to_add_collapsed))
+    else:
+        for ip in to_add_collapsed:
+            if _shutdown.is_set():
+                break
+            if add_cf_rule(ip):
+                added += 1
+                log.info("CF: Ajoute %s", ip)
+            time.sleep(0.1)
 
     for ip, rule_id in to_delete.items():
         if _shutdown.is_set():
@@ -2692,7 +2706,7 @@ def main() -> None:
     log.info("Protected ranges: %d réseaux chargés", len(_protected_networks))
 
     log.info(
-        "=== CrowdSec CF Sync V3.3 démarré (interval=%ds | dry_run=%s | "
+        "=== CrowdSec CF Sync V3.6.0 démarré (interval=%ds | dry_run=%s | "
         "confidence=%s | health_port=%s | state_version=%d | lua=%s) ===",
         INTERVAL, DRY_RUN, CF_MIN_CONFIDENCE,
         HEALTH_PORT if HEALTH_PORT else "disabled",
@@ -2875,12 +2889,12 @@ def main() -> None:
 if __name__ == "__main__":
     # ── Subcommand dispatch ────────────────────────────────────────────────────
     # Usage:
-    #   crowdsec-cf-syncV3.py               — run daemon (default)
-    #   crowdsec-cf-syncV3.py doctor        — system health audit
-    #   crowdsec-cf-syncV3.py wal inspect   — inspect WAL
-    #   crowdsec-cf-syncV3.py wal replay    — dry-run WAL replay
-    #   crowdsec-cf-syncV3.py wal replay --execute  — execute WAL replay
-    #   crowdsec-cf-syncV3.py wal compact   — compact WAL to net state
+    #   crowdsec-cf-sync               — run daemon (default)
+    #   crowdsec-cf-sync doctor        — system health audit
+    #   crowdsec-cf-sync wal inspect   — inspect WAL
+    #   crowdsec-cf-sync wal replay    — dry-run WAL replay
+    #   crowdsec-cf-sync wal replay --execute  — execute WAL replay
+    #   crowdsec-cf-sync wal compact   — compact WAL to net state
     args = sys.argv[1:]
     if args and args[0] == "doctor":
         sys.exit(cmd_doctor())

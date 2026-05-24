@@ -99,12 +99,12 @@ RuntimeDirectoryMode=0775
 
 **Order matters — restart Python BEFORE reloading OpenResty.** If OpenResty reloads while Python hasn't pushed yet, new Lua workers load the old `bans.json` (version=N) and set `last_version=N`. Python then starts at version=1, which is silently rejected by the sequence guard for hundreds of cycles.
 
-1. Verify syntax: `python3 -m py_compile /tmp/crowdsec-cf-syncV3.py`
-2. Backup: `cp /usr/local/bin/crowdsec-cf-syncV3.py /usr/local/bin/crowdsec-cf-syncV3.py.bak`
-3. Deploy Python: `cp /tmp/crowdsec-cf-syncV3.py /usr/local/bin/`
+1. Verify syntax: `python3 -m py_compile /tmp/crowdsec-cf-sync`
+2. Backup: `cp /usr/local/bin/crowdsec-cf-sync /usr/local/bin/crowdsec-cf-sync.bak`
+3. Deploy Python: `cp /tmp/crowdsec-cf-sync /usr/local/bin/`
 4. Deploy Lua (if changed): `cp lua/crowdsec/*.lua /etc/openresty/lua/crowdsec/`
 5. **Restart daemon first**: `systemctl restart crowdsec-cf-sync`
 6. **Wait 70 s for Python's first push** to land in `bans.json`
 7. **Then reload OpenResty**: `systemctl reload openresty` — new workers load `bans.json` (version=1), set `last_version=1`; next push at version=2 is accepted
 8. Verify: `curl -s http://127.0.0.1:8091/crowdsec-status | python3 -m json.tool`
-9. Check: `sudo bash -c 'env $(cat /etc/crowdsec/cf-sync.env | grep -v "^#" | xargs) python3 /usr/local/bin/crowdsec-cf-syncV3.py doctor'`
+9. Check: `sudo bash -c 'env $(cat /etc/crowdsec/cf-sync.env | grep -v "^#" | xargs) python3 /usr/local/bin/crowdsec-cf-sync doctor'`

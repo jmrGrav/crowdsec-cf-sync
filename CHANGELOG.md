@@ -2,6 +2,47 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.6.0] - 2026-05-24
+
+### Summary
+
+Rename supervisor from `crowdsec-cf-syncV3.py` to `crowdsec-cf-sync` (no extension,
+directly executable). Introduces native CrowdSec notification integration with a
+split push model: `crowdsec-notifier` handles event-driven Cloudflare and AbuseIPDB
+pushes at ~1–5s latency; `crowdsec-cf-sync` retains authoritative control over
+expiry cleanup and drift reconciliation.
+
+### Added
+
+- **`crowdsec-cf-sync`** — renamed from `crowdsec-cf-syncV3.py`; directly executable
+  via shebang, no `.py` extension. All paths updated in systemd unit and docs.
+
+- **`CF_NOTIFIER_ACTIVE` env flag** — when `1`, `sync_cloudflare()` skips the
+  `to_add` push loop (delegated to notifier). `to_delete` (expiry) and
+  `reconcile_state()` (drift) remain fully active.
+
+- **`SYNC_ABUSEIPDB` env flag** — when `0`, disables `sync_abuseipdb()` in the
+  supervisor to prevent double reporting when `crowdsec-notifier` is live.
+
+- **`cf_rule_count` Prometheus gauge** — tracks current Cloudflare access rules
+  managed by CrowdSec. Exposed at `/metrics` on `CF_HEALTH_PORT`.
+
+- **`examples/`** — sanitized configuration examples:
+  - `examples/crowdsec-notifier.py` — HTTP receiver for CrowdSec notification plugins
+  - `examples/notifications/abuseipdb.yaml` — AbuseIPDB plugin config
+  - `examples/notifications/cloudflare.yaml` — Cloudflare event-driven plugin config
+  - `examples/crowdsec/profiles.yaml.example` — CrowdSec profile with dual notifiers
+  - `examples/crowdsec/cf-sync.env.example` — env template with all flags documented
+
+- **`docs/notifier-architecture.md`** — full architecture doc: hot/cold path split,
+  anti-self-ban logic, dedup strategy, rollout phases, rollback procedure.
+
+### Changed
+
+- `systemd/crowdsec-cf-sync.service` — `ExecStart` updated to
+  `/usr/local/bin/crowdsec-cf-sync` (removed explicit `python3` prefix).
+- All docs and scripts updated: zero remaining `crowdsec-cf-syncV3.py` references.
+
 ## [3.5.0] - 2026-05-23
 
 ### Summary
@@ -369,7 +410,7 @@ All V3.4.0 security guarantees carry forward unchanged:
 - **CF quota warning** — `_fetch_cf_rules()` logs `WARNING` and increments `cf_quota_warnings` metric when rule count reaches 800/1000
 - **`ip -j addr` for own-IP detection** — `_build_protected_networks()` uses `ip -j addr` (reliable, machine-readable) instead of `hostname -I`; fallback to `socket.getaddrinfo(gethostname())` if `ip` is unavailable
 - **systemd hardening** — service unit adds `NoNewPrivileges`, `PrivateTmp`, `ProtectSystem=strict`, `ProtectHome`, `ProtectKernelTunables`, `ProtectKernelModules`, `ProtectControlGroups`, `RestrictSUIDSGID`, `MemoryDenyWriteExecute`, `LockPersonality`, `RestrictRealtime`, `SystemCallArchitectures=native`, `ReadWritePaths=/var/log/crowdsec/`, `ReadOnlyPaths=/var/log/nginx/`
-- **V1/V2 archived** — `crowdsec-cf-sync.py` (1.0.0) and `crowdsec-cf-syncV2.py` (2.0.0) moved to `archived/`; `crowdsec-cf-syncV3.py` is the single active script
+- **V1/V2 archived** — `crowdsec-cf-sync.py` (1.0.0) and `crowdsec-cf-syncV2.py` (2.0.0) moved to `archived/`; `crowdsec-cf-sync` is the single active script
 
 ### Changed
 - `_load_json_state()` — reads versioned envelope; falls back to V3 flat dict transparently

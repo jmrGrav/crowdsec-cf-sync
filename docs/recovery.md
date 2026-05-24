@@ -110,7 +110,7 @@ journalctl -u crowdsec-cf-sync -n 100 --no-pager | grep -E "ERROR|Traceback|Exce
 **Rollback Python daemon**:
 ```bash
 # Backup was created by deploy script
-cp /usr/local/bin/crowdsec-cf-syncV3.py.bak /usr/local/bin/crowdsec-cf-syncV3.py
+cp /usr/local/bin/crowdsec-cf-sync.bak /usr/local/bin/crowdsec-cf-sync
 systemctl start crowdsec-cf-sync
 ```
 
@@ -131,7 +131,7 @@ journalctl -u crowdsec-cf-sync | grep -i "cloudflare\|CF API\|cf_api"
 | Cause | Fix |
 |-------|-----|
 | `CF_API_TOKEN` expired | Rotate token, update `/etc/systemd/system/crowdsec-cf-sync.service`, `systemctl daemon-reload && systemctl restart crowdsec-cf-sync` |
-| CF zone quota (1000 rules) | Run `python3 /usr/local/bin/crowdsec-cf-syncV3.py doctor`; reduce ban TTLs or increase cleanup frequency |
+| CF zone quota (1000 rules) | Run `/usr/local/bin/crowdsec-cf-sync doctor`; reduce ban TTLs or increase cleanup frequency |
 | CF API rate limit | Daemon self-limits; errors are transient — wait for next cycle |
 | CF API outage | Monitor CF status page; daemon continues Lua sync in the meantime |
 
@@ -188,7 +188,7 @@ print(f'version: {d[\"version\"]}, age: {now-epoch:.0f}s, entries: {d[\"entry_co
 Run a comprehensive health audit:
 
 ```bash
-python3 /usr/local/bin/crowdsec-cf-syncV3.py doctor
+/usr/local/bin/crowdsec-cf-sync doctor
 ```
 
 Checks: daemon status, WAL, state files, CF API, CrowdSec LAPI, Lua sync, dict memory, permissions, nginx config.

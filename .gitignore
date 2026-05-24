@@ -7,7 +7,7 @@ __pycache__/
 dist/
 build/
 .env
+*.env
 *.log
 *.json
-!crowdsec-cf-sync.py
 .DS_Store

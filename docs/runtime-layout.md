@@ -16,7 +16,7 @@ Run `openresty -T 2>/dev/null | grep "configuration file"` to see all active con
 ## Python daemon
 
 ```
-/usr/local/bin/crowdsec-cf-syncV3.py    executable, root
+/usr/local/bin/crowdsec-cf-sync    executable, root
 /etc/systemd/system/crowdsec-cf-sync.service
 ```
 
@@ -108,7 +108,7 @@ Accessible only from loopback. Verify port: `openresty -T | grep -A2 'crowdsec-s
 | `/run/crowdsec-lua/bans.json` | root:root | 644 | Readable by www-data |
 | `/run/crowdsec-lua/events.jsonl` | root:root | 644 | Written by Lua workers via `ngx.shared` |
 | `/etc/openresty/lua/crowdsec/*.lua` | root:root | 644 | Read at `init_by_lua_block` |
-| `/usr/local/bin/crowdsec-cf-syncV3.py` | root:root | 755 | Run as root |
+| `/usr/local/bin/crowdsec-cf-sync` | root:root | 755 | Run as root |
 
 ## OpenResty reload vs restart
 

@@ -1,0 +1,24 @@
+# CrowdSec notification plugin — AbuseIPDB reporter
+# Place in: /etc/crowdsec/notifications/abuseipdb.yaml
+# Then add to /etc/crowdsec/profiles.yaml: notifications: [abuseipdb_notifier]
+# Requires: crowdsec-notifier.py running on 127.0.0.1:9999
+
+type: http
+name: abuseipdb_notifier
+log_level: info
+
+# Batch alerts for 30s (or until 10 accumulate) before delivery
+# AbuseIPDB: batch is fine, rate limit is 1000 reports/day
+group_wait: 30s
+group_threshold: 10
+max_retry: 3
+timeout: 20s
+
+# {{.|toJson}} delivers the raw models.Alert array — receiver parses it directly
+format: |
+  {{.|toJson}}
+
+url: http://127.0.0.1:9999/crowdsec/abuseipdb
+method: POST
+headers:
+  Content-Type: "application/json"

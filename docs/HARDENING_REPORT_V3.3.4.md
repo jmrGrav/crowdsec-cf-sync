@@ -43,7 +43,7 @@ Internet → Cloudflare (CDN/WAF) → OpenResty (NUC)
 
 **IPC Python ↔ Lua:**
 ```
-Python daemon (crowdsec-cf-syncV3.py)
+Python daemon (crowdsec-cf-sync)
   ↓ writes /run/crowdsec-lua/bans.json  (every 60s, version-stamped)
 Lua sync.lua (init_worker_by_lua_block timer)
   ↓ reads bans.json → cscf_verdicts shared dict
@@ -354,7 +354,7 @@ Tous les fichiers Lua du repo (`/tmp/crowdsec-cf-sync/lua/crowdsec/`) sont en sy
 
 ## 15. Check-list pré-release
 
-- [x] `python3 -m py_compile crowdsec-cf-syncV3.py` — syntax OK
+- [x] `python3 -m py_compile crowdsec-cf-sync` — syntax OK
 - [x] `openresty -t` — config OK
 - [x] `sudo -u jm -E bash scripts/regression-test.sh` — **31/31 PASS**
 - [x] `vector validate /etc/vector/vector.yaml` — OK
