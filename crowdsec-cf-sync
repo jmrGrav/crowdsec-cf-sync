@@ -59,7 +59,64 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple, TypedDict
+
+# ── Models (TypedDict) ────────────────────────────────────────────────────────
+# Explicit schemas for recurring data structures. Pure typing — zero runtime
+# cost, zero behavior change. All are structurally compatible with plain dict.
+# Extracted to crowdsec_cf_sync/models.py in Step 8.
+
+class LocalBan(TypedDict):
+    ip:       str
+    scenario: str
+    origin:   str
+    dt:       str
+    id:       str
+
+class RecidivistEntry(TypedDict):
+    count:     int
+    last_seen: str
+
+class ModsecEvent(TypedDict):
+    ip:    str
+    score: int
+    uri:   str
+    dt:    str
+
+class ModsecStateEntry(TypedDict):
+    banned_at: str
+    score:     int
+    uri:       str
+
+class CidrStateEntry(TypedDict):
+    banned_at: str
+    ip_count:  int
+
+class BouncerDenial(TypedDict):
+    ip:     str
+    dt:     str
+    method: str
+    path:   str
+    host:   str
+
+class BouncerCheckEntry(TypedDict):
+    checked_at: str
+    score:      int
+
+class WalEntry(TypedDict):
+    id:      int
+    op:      str
+    target:  str
+    tag:     str
+    ts:      str
+    attempt: int
+    dry_run: bool
+
+class LuaBanEntry(TypedDict):
+    score:  int
+    level:  int
+    ttl:    int
+    reason: str
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 CF_API_TOKEN       = os.environ.get("CF_API_TOKEN", "")
@@ -495,7 +552,7 @@ def _wal_log(op: str, target: str, tag: str = "", dry_run: bool = False,
     """Append a CF operation intent to the WAL with fsync before returning."""
     global _wal_seq
     _wal_seq += 1
-    entry = {
+    entry: WalEntry = {
         "id":      _wal_seq,
         "op":      op,       # "add" | "remove" | "reconcile"
         "target":  target,
@@ -1083,11 +1140,11 @@ def get_active_bans() -> Optional[Set[str]]:
 
 
 # ── CrowdSec — recent bans from decisions.log ─────────────────────────────────
-def get_recent_local_bans(hours: int = LOOKBACK_HOURS) -> List[dict]:
+def get_recent_local_bans(hours: int = LOOKBACK_HOURS) -> List[LocalBan]:
     if not DECISIONS_LOG.exists():
         return []
     cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
-    bans: List[dict] = []
+    bans: List[LocalBan] = []
     try:
         with DECISIONS_LOG.open() as f:
             for line in f:
@@ -1266,11 +1323,11 @@ MODSEC_DATE_RE = re.compile(r"(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2})")
 BOUNCER_RE     = re.compile(r"\[Crowdsec\] denied '(?P<ip>[^']+)' with 'ban'")
 
 
-def get_recent_modsec_events(hours: int = LOOKBACK_HOURS) -> List[dict]:
+def get_recent_modsec_events(hours: int = LOOKBACK_HOURS) -> List[ModsecEvent]:
     if not NGINX_ERROR_LOG.exists():
         return []
     cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
-    events: List[dict] = []
+    events: List[ModsecEvent] = []
     try:
         with NGINX_ERROR_LOG.open(errors="replace") as f:
             for line in f:
@@ -1385,11 +1442,11 @@ def cleanup_modsec_cf_rules(modsec_state: dict) -> None:
 
 
 # ── OpenResty bouncer ─────────────────────────────────────────────────────────
-def get_recent_bouncer_denials(hours: int = 1) -> List[dict]:
+def get_recent_bouncer_denials(hours: int = 1) -> List[BouncerDenial]:
     if not NGINX_ERROR_LOG.exists():
         return []
     cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
-    events: List[dict] = []
+    events: List[BouncerDenial] = []
     try:
         with NGINX_ERROR_LOG.open(errors="replace") as f:
             for line in f:
@@ -2146,7 +2203,7 @@ def push_lua_state(
 
         _lua_sync_version += 1
 
-        bans: Dict[str, dict] = {}
+        bans: Dict[str, LuaBanEntry] = {}
 
         # Active CrowdSec bans: score reflects recidivism
         for ip in active_bans:
@@ -2162,7 +2219,7 @@ def push_lua_state(
                 bans[ip] = {"score": 80, "level": 5, "ttl": MODSEC_BAN_SECS, "reason": "modsec-ban"}
 
         # CIDR bans
-        cidrs: Dict[str, dict] = {}
+        cidrs: Dict[str, LuaBanEntry] = {}
         for cidr in cidr_state:
             cidrs[cidr] = {"score": 100, "level": 5, "ttl": 86400, "reason": "crowdsec-cidr"}
 
