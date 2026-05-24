@@ -69,6 +69,12 @@ from crowdsec_cf_sync.state_store import (
     STATE_VERSION, StateStore,
     _load_json_state, _atomic_write_json,
 )
+import crowdsec_cf_sync.wal as _wal_mod
+from crowdsec_cf_sync.wal import (
+    WAL_FILE,
+    _init_wal_seq, _wal_log, _wal_trim,
+    cmd_wal_inspect, cmd_wal_replay, cmd_wal_compact,
+)
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 CF_API_TOKEN       = os.environ.get("CF_API_TOKEN", "")
@@ -117,7 +123,6 @@ LOCAL_ORIGINS       = {"crowdsec", "cscli"}
 DECISIONS_LOG       = Path("/var/log/crowdsec/decisions.log")
 NGINX_ERROR_LOG     = Path("/var/log/nginx/error.log")
 CF_LOG_FILE         = Path("/var/log/crowdsec/cf-sync.log")
-WAL_FILE            = Path("/var/log/crowdsec/cf-sync-wal.jsonl")
 ABUSE_STATE         = Path("/var/log/crowdsec/abuseipdb-reported.json")
 RECIDIV_STATE       = Path("/var/log/crowdsec/recidivists.json")
 MODSEC_STATE        = Path("/var/log/crowdsec/modsec-banned.json")
@@ -202,7 +207,6 @@ _PROTECTED_CIDRS_STATIC: List[str] = [
 # ── Module-level state ────────────────────────────────────────────────────────
 _shutdown  = threading.Event()
 _reload    = threading.Event()
-_wal_seq: int  = 0           # monotonic WAL entry counter; initialized from WAL on startup
 _boot_healthy: bool = False  # True after first successful CF API probe
 _degraded_reason: str = ""   # non-empty when in degraded mode
 _lua_sync_version: int = 0   # monotonic version pushed to Lua sync file
@@ -385,60 +389,6 @@ _MODSEC_STORE   = StateStore(lambda: MODSEC_STATE)
 _CIDR_STORE     = StateStore(lambda: CIDR_STATE)
 _CF_WAF_STORE   = StateStore(lambda: CF_WAF_STATE, default={"last_event_dt": None})
 _BOUNCER_STORE  = StateStore(lambda: BOUNCER_CHECK_STATE)
-
-
-# ── WAL (write-ahead log) ─────────────────────────────────────────────────────
-def _init_wal_seq() -> int:
-    """Return current WAL line count so IDs continue across restarts."""
-    if not WAL_FILE.exists():
-        return 0
-    try:
-        with WAL_FILE.open(encoding="utf-8", errors="ignore") as f:
-            return sum(1 for _ in f)
-    except Exception:
-        return 0
-
-
-def _wal_log(op: str, target: str, tag: str = "", dry_run: bool = False,
-             attempt: int = 1) -> None:
-    """Append a CF operation intent to the WAL with fsync before returning."""
-    global _wal_seq
-    _wal_seq += 1
-    entry: WalEntry = {
-        "id":      _wal_seq,
-        "op":      op,       # "add" | "remove" | "reconcile"
-        "target":  target,
-        "tag":     tag,
-        "ts":      datetime.now(timezone.utc).isoformat(),
-        "attempt": attempt,
-        "dry_run": dry_run,
-    }
-    try:
-        with WAL_FILE.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(entry) + "\n")
-            f.flush()
-            os.fsync(f.fileno())   # crash-durable WAL entry
-        metrics.inc("wal_entries")
-    except Exception as exc:
-        log.debug("WAL write failed: %s", exc)
-
-
-def _wal_trim(max_lines: int = 10_000) -> None:
-    if not WAL_FILE.exists():
-        return
-    try:
-        lines = WAL_FILE.read_text(encoding="utf-8").splitlines(keepends=True)
-        if len(lines) > max_lines:
-            keep = lines[-max_lines:]
-            tmp_fd, tmp_path = tempfile.mkstemp(dir=WAL_FILE.parent, suffix=".tmp")
-            with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
-                f.writelines(keep)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp_path, WAL_FILE)
-            log.info("WAL: compacté %d → %d lignes", len(lines), len(keep))
-    except Exception as exc:
-        log.debug("WAL trim failed: %s", exc)
 
 
 # ── Protected ranges (anti-self-ban) ─────────────────────────────────────────
@@ -2283,148 +2233,6 @@ def check_lua_autoheal() -> None:
         slog("autoheal", "reload_error", level=logging.ERROR, error=str(exc))
 
 
-# ── WAL tools ─────────────────────────────────────────────────────────────────
-
-def cmd_wal_inspect() -> None:
-    """Print a human-readable summary of the WAL."""
-    if not WAL_FILE.exists():
-        print(f"WAL file not found: {WAL_FILE}")
-        return
-    entries = []
-    errors = 0
-    with WAL_FILE.open(encoding="utf-8", errors="ignore") as f:
-        for i, line in enumerate(f, 1):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                entries.append(json.loads(line))
-            except json.JSONDecodeError:
-                errors += 1
-                print(f"  [line {i}] INVALID JSON: {line[:80]}")
-
-    print(f"WAL: {WAL_FILE}")
-    print(f"  Total entries: {len(entries)}, parse errors: {errors}")
-    if not entries:
-        return
-
-    by_action: Dict[str, int] = {}
-    ips: set = set()
-    for e in entries:
-        action = e.get("action", "?")
-        by_action[action] = by_action.get(action, 0) + 1
-        if "ip" in e:
-            ips.add(e["ip"])
-
-    print(f"  Unique IPs: {len(ips)}")
-    print(f"  Actions:")
-    for action, count in sorted(by_action.items(), key=lambda x: -x[1]):
-        print(f"    {action}: {count}")
-
-    first_ts = entries[0].get("ts", "?")
-    last_ts  = entries[-1].get("ts", "?")
-    print(f"  Time range: {first_ts} → {last_ts}")
-    print(f"  Last 5 entries:")
-    for e in entries[-5:]:
-        print(f"    {json.dumps(e)}")
-
-
-def cmd_wal_replay(dry_run: bool = True) -> None:
-    """Re-apply WAL entries (add/remove CF rules) from the WAL log.
-
-    Use dry_run=True (default) to preview; pass --execute to actually apply.
-    """
-    if not WAL_FILE.exists():
-        print(f"WAL file not found: {WAL_FILE}")
-        return
-
-    adds: List[str] = []
-    removes: List[str] = []
-    with WAL_FILE.open(encoding="utf-8", errors="ignore") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                e = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            action = e.get("action", "")
-            ip = e.get("ip", "")
-            if not ip:
-                continue
-            if action in ("add", "ban"):
-                adds.append(ip)
-            elif action in ("remove", "unban"):
-                removes.append(ip)
-
-    # Net state: last action per IP wins
-    net: Dict[str, str] = {}
-    with WAL_FILE.open(encoding="utf-8", errors="ignore") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                e = json.loads(line)
-                ip = e.get("ip", "")
-                if ip:
-                    net[ip] = e.get("action", "?")
-            except json.JSONDecodeError:
-                continue
-
-    to_add    = [ip for ip, act in net.items() if act in ("add", "ban")]
-    to_remove = [ip for ip, act in net.items() if act in ("remove", "unban")]
-
-    print(f"WAL replay {'(DRY RUN)' if dry_run else '(EXECUTE)'}:")
-    print(f"  Net state: {len(to_add)} to add, {len(to_remove)} to remove")
-    for ip in to_add[:20]:
-        print(f"  + {ip}")
-    for ip in to_remove[:20]:
-        print(f"  - {ip}")
-    if not dry_run:
-        print("  Execute not yet implemented — use the main daemon loop instead.")
-
-
-def cmd_wal_compact() -> None:
-    """Collapse WAL to net state: one entry per IP, removes cancelling pairs."""
-    if not WAL_FILE.exists():
-        print(f"WAL file not found: {WAL_FILE}")
-        return
-
-    entries = []
-    with WAL_FILE.open(encoding="utf-8", errors="ignore") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                entries.append(json.loads(line))
-            except json.JSONDecodeError:
-                pass
-
-    before = len(entries)
-    # Keep only the last entry per IP
-    net: Dict[str, dict] = {}
-    for e in entries:
-        ip = e.get("ip", "")
-        if ip:
-            net[ip] = e
-
-    compacted = list(net.values())
-    after = len(compacted)
-
-    print(f"WAL compact: {before} → {after} entries (removed {before - after} duplicates)")
-
-    bak = WAL_FILE.with_suffix(".jsonl.bak")
-    WAL_FILE.rename(bak)
-    with WAL_FILE.open("w", encoding="utf-8") as f:
-        for e in compacted:
-            f.write(json.dumps(e, ensure_ascii=False) + "\n")
-    print(f"  Backup: {bak}")
-    print(f"  Compacted WAL: {WAL_FILE}")
-
-
 # ── Doctor ────────────────────────────────────────────────────────────────────
 
 def cmd_doctor() -> int:
@@ -2635,7 +2443,7 @@ def cmd_doctor() -> int:
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main() -> None:
-    global _boot_healthy, _degraded_reason, _wal_seq, _protected_networks
+    global _boot_healthy, _degraded_reason, _protected_networks
 
     _check_config()
 
@@ -2658,8 +2466,8 @@ def main() -> None:
     _start_health_server()
 
     # Initialize WAL sequence from existing WAL, trim on startup
-    _wal_seq = _init_wal_seq()
-    log.info("WAL: %d entrées existantes (prochain id: %d)", _wal_seq, _wal_seq + 1)
+    _wal_mod._wal_seq = _init_wal_seq()
+    log.info("WAL: %d entrées existantes (prochain id: %d)", _wal_mod._wal_seq, _wal_mod._wal_seq + 1)
     _wal_trim()
 
     # Probe CF connectivity at boot
