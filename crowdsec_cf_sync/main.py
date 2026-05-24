@@ -2371,6 +2371,15 @@ def cmd_doctor() -> int:
         return 2
 
 
+def _sync_lua_state(cidr_state: dict, modsec_state: dict, recidivists: dict) -> None:
+    if LUA_ENABLED and not _shutdown.is_set():
+        _active = get_active_bans()
+        if _active is not None:
+            push_lua_state(_active, cidr_state, modsec_state, recidivists)
+        # Auto-heal: check if Lua sync timer is alive
+        check_lua_autoheal()
+
+
 def _sync_crowdsec_sources(
     reported: dict,
     recidivists: dict,
@@ -2555,12 +2564,7 @@ def main() -> None:
             )
 
             # ── Lua state push (after all local state is up to date) ──────────
-            if LUA_ENABLED and not _shutdown.is_set():
-                _active = get_active_bans()
-                if _active is not None:
-                    push_lua_state(_active, cidr_state, modsec_state, recidivists)
-                # Auto-heal: check if Lua sync timer is alive
-                check_lua_autoheal()
+            _sync_lua_state(cidr_state, modsec_state, recidivists)
 
             # WAF poll (every CF_WAF_POLL_SECS)
             waf_poll_count += 1
