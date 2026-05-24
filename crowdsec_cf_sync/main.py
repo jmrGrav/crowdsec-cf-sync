@@ -2371,6 +2371,15 @@ def cmd_doctor() -> int:
         return 2
 
 
+def _ingest_lua_events(reported: dict, cs_allowlist: List[str]) -> dict:
+    # Atomic rename avoids read-truncate race with Lua append.
+    if LUA_ENABLED and not _shutdown.is_set():
+        lua_events = read_lua_events()
+        if lua_events:
+            reported = process_lua_events(lua_events, reported, cs_allowlist)
+    return reported
+
+
 def _try_recover_degraded(cycle_start: float) -> bool:
     """Returns True if the cycle should be skipped (CF still unreachable)."""
     global _boot_healthy, _degraded_reason
@@ -2509,11 +2518,7 @@ def main() -> None:
 
         try:
             # ── Lua event ingestion (start of cycle) ──────────────────────────
-            # Atomic rename avoids read-truncate race with Lua append.
-            if LUA_ENABLED and not _shutdown.is_set():
-                lua_events = read_lua_events()
-                if lua_events:
-                    reported = process_lua_events(lua_events, reported, cs_allowlist)
+            reported = _ingest_lua_events(reported, cs_allowlist)
 
             sync_cloudflare(cs_allowlist)
 
