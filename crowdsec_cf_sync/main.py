@@ -2371,6 +2371,28 @@ def cmd_doctor() -> int:
         return 2
 
 
+def _try_recover_degraded(cycle_start: float) -> bool:
+    """Returns True if the cycle should be skipped (CF still unreachable)."""
+    global _boot_healthy, _degraded_reason
+    if _boot_healthy:
+        return False
+    try:
+        _fetch_cf_rules()
+        _sup._boot_healthy = True
+        _boot_healthy    = True
+        _sup._degraded_reason = ""
+        _degraded_reason = ""
+        log.info("CF rétabli — sortie du mode dégradé")
+        return False
+    except Exception:
+        log.warning("Mode dégradé: CF toujours inaccessible, sync CF ignoré ce cycle")
+        _sd_notify(f"WATCHDOG=1\nSTATUS=Degraded: {_degraded_reason}\n")
+        elapsed   = time.monotonic() - cycle_start
+        remaining = max(0.0, INTERVAL - elapsed)
+        _shutdown.wait(timeout=remaining)
+        return True
+
+
 def _startup_daemon() -> tuple:
     global _boot_healthy, _degraded_reason, _protected_networks
 
@@ -2482,21 +2504,8 @@ def main() -> None:
         cs_allowlist = _handle_reload_if_needed(cs_allowlist)
 
         # Auto-recover from degraded boot once CF is reachable
-        if not _boot_healthy:
-            try:
-                _fetch_cf_rules()
-                _sup._boot_healthy = True
-                _boot_healthy    = True
-                _sup._degraded_reason = ""
-                _degraded_reason = ""
-                log.info("CF rétabli — sortie du mode dégradé")
-            except Exception:
-                log.warning("Mode dégradé: CF toujours inaccessible, sync CF ignoré ce cycle")
-                _sd_notify(f"WATCHDOG=1\nSTATUS=Degraded: {_degraded_reason}\n")
-                elapsed   = time.monotonic() - cycle_start
-                remaining = max(0.0, INTERVAL - elapsed)
-                _shutdown.wait(timeout=remaining)
-                continue
+        if _try_recover_degraded(cycle_start):
+            continue
 
         try:
             # ── Lua event ingestion (start of cycle) ──────────────────────────
