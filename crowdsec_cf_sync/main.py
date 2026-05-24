@@ -261,9 +261,15 @@ class CircuitBreaker:
                 metrics.inc("circuit_breaker_trips")
 
 
-_cb_cf  = CircuitBreaker("cloudflare")
-_cb_cs  = CircuitBreaker("crowdsec")
-_cb_abu = CircuitBreaker("abuseipdb")
+_sup._cb_cf  = CircuitBreaker("cloudflare")
+_sup._cb_cs  = CircuitBreaker("crowdsec")
+_sup._cb_abu = CircuitBreaker("abuseipdb")
+
+# Phase-9.2 aliases — CircuitBreaker objects are shared (mutations visible through
+# both names); module-level aliases preserve all existing call-sites.
+_cb_cf  = _sup._cb_cf
+_cb_cs  = _sup._cb_cs
+_cb_abu = _sup._cb_abu
 
 
 # ── Config validation ─────────────────────────────────────────────────────────
