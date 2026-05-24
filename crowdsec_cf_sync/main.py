@@ -2371,6 +2371,20 @@ def cmd_doctor() -> int:
         return 2
 
 
+def _handle_reload_if_needed(cs_allowlist: List[str]) -> List[str]:
+    global _protected_networks
+    if not _reload.is_set():
+        return cs_allowlist
+    _reload.clear()
+    log.info("Hot reload: rechargement allowlist + protected ranges")
+    cs_allowlist = get_crowdsec_allowlist()
+    _protected_networks = _build_protected_networks()
+    _sup._protected_networks = _protected_networks
+    log.info("Hot reload terminé — allowlist: %d entrées, protected: %d nets",
+             len(cs_allowlist), len(_protected_networks))
+    return cs_allowlist
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main() -> None:
     global _boot_healthy, _degraded_reason, _protected_networks
@@ -2455,14 +2469,7 @@ def main() -> None:
         cycle_start = time.monotonic()
 
         # Hot reload on SIGHUP
-        if _reload.is_set():
-            _reload.clear()
-            log.info("Hot reload: rechargement allowlist + protected ranges")
-            cs_allowlist = get_crowdsec_allowlist()
-            _protected_networks = _build_protected_networks()
-            _sup._protected_networks = _protected_networks
-            log.info("Hot reload terminé — allowlist: %d entrées, protected: %d nets",
-                     len(cs_allowlist), len(_protected_networks))
+        cs_allowlist = _handle_reload_if_needed(cs_allowlist)
 
         # Auto-recover from degraded boot once CF is reachable
         if not _boot_healthy:
