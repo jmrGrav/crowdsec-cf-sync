@@ -446,6 +446,38 @@ def _atomic_write_json(path: Path, data: dict) -> None:
             pass
 
 
+# ── StateStore — per-domain envelope wrapper ─────────────────────────────────
+# One instance per state file. Path is resolved via a getter so module-level
+# constants can be hot-swapped (tests). default is the value returned on
+# absent-file load — copied per call so caller mutations cannot leak back.
+# All invariants (V4 envelope, sha256 canonical, .bak on corruption,
+# atomic write, V3 backward compat) live in _load_json_state / _atomic_write_json
+# above; this class is a thin per-path binding to consolidate the 12
+# previous load_X / save_X wrappers.
+# See docs/state-format.md for the normative contract.
+
+class StateStore:
+    def __init__(self, path_getter, default=None) -> None:
+        self._get_path = path_getter
+        self._default  = default if default is not None else {}
+
+    def load(self) -> dict:
+        return _load_json_state(self._get_path(), self._default)
+
+    def save(self, data: dict) -> None:
+        _atomic_write_json(self._get_path(), data)
+
+
+# Per-domain singletons. Getters resolve module-level constants dynamically
+# so tests can redirect paths via setattr without re-wiring the stores.
+_RECIDIV_STORE  = StateStore(lambda: RECIDIV_STATE)
+_REPORTED_STORE = StateStore(lambda: ABUSE_STATE)
+_MODSEC_STORE   = StateStore(lambda: MODSEC_STATE)
+_CIDR_STORE     = StateStore(lambda: CIDR_STATE)
+_CF_WAF_STORE   = StateStore(lambda: CF_WAF_STATE, default={"last_event_dt": None})
+_BOUNCER_STORE  = StateStore(lambda: BOUNCER_CHECK_STATE)
+
+
 # ── WAL (write-ahead log) ─────────────────────────────────────────────────────
 def _init_wal_seq() -> int:
     """Return current WAL line count so IDs continue across restarts."""
@@ -1115,19 +1147,19 @@ def get_recent_local_bans(hours: int = LOOKBACK_HOURS) -> List[dict]:
 
 # ── Recidivists ───────────────────────────────────────────────────────────────
 def load_recidivists() -> dict:
-    return _load_json_state(RECIDIV_STATE, {})
+    return _RECIDIV_STORE.load()
 
 
 def save_recidivists(recidivists: dict) -> None:
-    _atomic_write_json(RECIDIV_STATE, recidivists)
+    _RECIDIV_STORE.save(recidivists)
 
 
 def load_reported() -> dict:
-    return _load_json_state(ABUSE_STATE, {})
+    return _REPORTED_STORE.load()
 
 
 def save_reported(reported: dict) -> None:
-    _atomic_write_json(ABUSE_STATE, reported)
+    _REPORTED_STORE.save(reported)
 
 
 def purge_old_recidivists(recidivists: dict) -> dict:
@@ -1272,11 +1304,11 @@ def get_recent_modsec_events(hours: int = LOOKBACK_HOURS) -> List[dict]:
 
 
 def load_modsec_state() -> dict:
-    return _load_json_state(MODSEC_STATE, {})
+    return _MODSEC_STORE.load()
 
 
 def save_modsec_state(state: dict) -> None:
-    _atomic_write_json(MODSEC_STATE, state)
+    _MODSEC_STORE.save(state)
 
 
 def sync_modsec(
@@ -1391,11 +1423,11 @@ def get_recent_bouncer_denials(hours: int = 1) -> List[dict]:
 
 
 def load_bouncer_check_state() -> dict:
-    return _load_json_state(BOUNCER_CHECK_STATE, {})
+    return _BOUNCER_STORE.load()
 
 
 def save_bouncer_check_state(state: dict) -> None:
-    _atomic_write_json(BOUNCER_CHECK_STATE, state)
+    _BOUNCER_STORE.save(state)
 
 
 def sync_bouncer_abuseipdb(
@@ -1471,11 +1503,11 @@ def sync_bouncer_abuseipdb(
 
 # ── CIDR ban ──────────────────────────────────────────────────────────────────
 def load_cidr_state() -> dict:
-    return _load_json_state(CIDR_STATE, {})
+    return _CIDR_STORE.load()
 
 
 def save_cidr_state(state: dict) -> None:
-    _atomic_write_json(CIDR_STATE, state)
+    _CIDR_STORE.save(state)
 
 
 def get_cidr24(ip_str: str) -> Optional[str]:
@@ -1928,11 +1960,11 @@ def reconcile_state(cs_allowlist: Set[str]) -> int:
 
 # ── Cloudflare WAF polling ────────────────────────────────────────────────────
 def load_cf_waf_state() -> dict:
-    return _load_json_state(CF_WAF_STATE, {"last_event_dt": None})
+    return _CF_WAF_STORE.load()
 
 
 def save_cf_waf_state(state: dict) -> None:
-    _atomic_write_json(CF_WAF_STATE, state)
+    _CF_WAF_STORE.save(state)
 
 
 def fetch_cf_waf_events(since: str) -> list:
