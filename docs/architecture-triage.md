@@ -197,9 +197,10 @@ Ordre **non négociable** :
 3. ✅ docs/ipc-schema.md — contrat Python↔Lua (DONE 2026-05-24)
 4. ✅ Golden tests state files (54 tests) (DONE 2026-05-24)
 5. ✅ Golden tests WAL (32 tests) (DONE 2026-05-24)
-6. ⏳ F7 — Models (dataclass/TypedDict, sérialisation préservée)  ← NEXT
-7. ⏳ F3 — StateStore (extraction load_X/save_X)
-8. ⏳ F1 phases 1-4 — Safe Extraction (state_store, wal, models, config)
+5b. ✅ Prod-pattern fixtures + corruption variants (+18 tests) (DONE 2026-05-24)
+6. ✅ F3 — StateStore (extraction load_X/save_X) in-file class (DONE 2026-05-24, branch refactor/state-store-extraction)
+7. ⏳ F7 — Models (dataclass/TypedDict, sérialisation préservée)  ← NEXT
+8. ⏳ F1 phases 1-4 — Safe Extraction (move StateStore to state_store.py + wal.py + models.py + config.py — true package layout)
 9. ⏳ F1 phase 5 + F2 + F6 — Supervisor class
 10. ⏳ F1 phase 6 + F5 — Pipeline explicite
 11. ⏳ F4 — IPC Contract formalisé (JSON Schema files)

@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "updated_at": "2026-05-24T10:00:00.000000+00:00",
+  "sha256": "77f2be0f895c278f2c1500daf03eb3ab8cbd9b8ca1c991983de0cb0a6f6eb876",
+  "state": {
+    "192.0.2.0/24": {
+      "first_seen": "2026-05-20T10:00:00+00:00",
+      "ip_count": 8,
+      "scenarios": [
+        "crowdsecurity/http-probing",
+        "crowdsecurity/http-bf"
+      ]
+    }
+  }
+}

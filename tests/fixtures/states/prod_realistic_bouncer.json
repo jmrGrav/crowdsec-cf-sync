@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "updated_at": "2026-05-24T10:00:00.000000+00:00",
+  "sha256": "2c5cd7787c89cb1bec20c38a67fb142d16bbe0fc9cae0e39872497b362578909",
+  "state": {
+    "192.0.2.40": {
+      "checked_at": "2026-05-23T12:00:00+00:00",
+      "score": 87,
+      "country": "RU",
+      "isp": "AS-EXAMPLE",
+      "total_reports": 142,
+      "method": "POST",
+      "path": "/wp-login.php",
+      "host": "example.org"
+    },
+    "192.0.2.41": {
+      "checked_at": "2026-05-23T12:05:00+00:00",
+      "score": 100,
+      "country": "-",
+      "isp": "-",
+      "total_reports": 1024,
+      "method": "GET",
+      "path": "/.env",
+      "host": "example.org"
+    }
+  }
+}

@@ -1,0 +1,39 @@
+{
+  "version": 1,
+  "updated_at": "2026-05-24T10:00:00.000000+00:00",
+  "sha256": "d747023c26b5adb02ec962f04a0ac1ec9c4a355f4b21e9d756b3301c4908c4f0",
+  "state": {
+    "last_processed": "2026-04-09T21:29:42Z",
+    "pending_events": [
+      {
+        "ip": "198.51.100.10",
+        "datetime": "2026-04-09T21:31:12Z",
+        "action": "managed_challenge",
+        "path": "/shell.php",
+        "method": "GET"
+      },
+      {
+        "ip": "198.51.100.10",
+        "datetime": "2026-04-09T21:30:42Z",
+        "action": "managed_challenge",
+        "path": "/wp.php",
+        "method": "GET"
+      },
+      {
+        "ip": "198.51.100.10",
+        "datetime": "2026-04-09T21:30:12Z",
+        "action": "block",
+        "path": "/backdoor.php",
+        "method": "GET"
+      },
+      {
+        "ip": "198.51.100.11",
+        "datetime": "2026-04-09T21:33:00Z",
+        "action": "challenge",
+        "path": "/admin",
+        "method": "POST"
+      }
+    ],
+    "last_event_dt": "2026-05-24T10:50:00Z"
+  }
+}
