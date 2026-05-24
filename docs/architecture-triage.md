@@ -200,8 +200,8 @@ Ordre **non négociable** :
 5b. ✅ Prod-pattern fixtures + corruption variants (+18 tests) (DONE 2026-05-24)
 6. ✅ F3 — StateStore (extraction load_X/save_X) in-file class (DONE 2026-05-24, branch refactor/state-store-extraction)
 7. ✅ F7 — Models (dataclass/TypedDict, sérialisation préservée) (DONE 2026-05-24, commit 3f152c0)
-8. ⏳ F1 phases 1-4 — Safe Extraction (move StateStore to state_store.py + wal.py + models.py + config.py — true package layout)  ← NEXT
-9. ⏳ F1 phase 5 + F2 + F6 — Supervisor class
+8. ✅ F1 phases 1-4 — Safe Extraction (state_store.py + wal.py + models.py + config.py — true package layout) (DONE 2026-05-25, branch refactor/package-extraction)
+9. ✅ F1 phase 5 + F2 + F6 — Supervisor class (phases 9.1–9.4: globals→attrs, CB, lua/health/protected, _sup.* sync) (DONE 2026-05-25)
 10. ⏳ F1 phase 6 + F5 — Pipeline explicite
 11. ⏳ F4 — IPC Contract formalisé (JSON Schema files)
 ```
