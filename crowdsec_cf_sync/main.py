@@ -2371,6 +2371,24 @@ def cmd_doctor() -> int:
         return 2
 
 
+def _run_waf_poll_if_due(
+    waf_poll_count: int,
+    waf_state: dict,
+    recidivists: dict,
+    cs_allowlist: List[str],
+    reported: dict,
+) -> tuple:
+    waf_poll_count += 1
+    if (
+        not _shutdown.is_set()
+        and waf_poll_count % max(1, CF_WAF_POLL_SECS // INTERVAL) == 0
+    ):
+        waf_state, recidivists, reported = poll_cloudflare_waf(
+            waf_state, recidivists, cs_allowlist, reported
+        )
+    return (waf_poll_count, waf_state, recidivists, reported)
+
+
 def _sync_lua_state(cidr_state: dict, modsec_state: dict, recidivists: dict) -> None:
     if LUA_ENABLED and not _shutdown.is_set():
         _active = get_active_bans()
@@ -2567,14 +2585,9 @@ def main() -> None:
             _sync_lua_state(cidr_state, modsec_state, recidivists)
 
             # WAF poll (every CF_WAF_POLL_SECS)
-            waf_poll_count += 1
-            if (
-                not _shutdown.is_set()
-                and waf_poll_count % max(1, CF_WAF_POLL_SECS // INTERVAL) == 0
-            ):
-                waf_state, recidivists, reported = poll_cloudflare_waf(
-                    waf_state, recidivists, cs_allowlist, reported
-                )
+            waf_poll_count, waf_state, recidivists, reported = _run_waf_poll_if_due(
+                waf_poll_count, waf_state, recidivists, cs_allowlist, reported
+            )
 
             # Periodic reconciliation
             if (
