@@ -2371,22 +2371,7 @@ def cmd_doctor() -> int:
         return 2
 
 
-def _handle_reload_if_needed(cs_allowlist: List[str]) -> List[str]:
-    global _protected_networks
-    if not _reload.is_set():
-        return cs_allowlist
-    _reload.clear()
-    log.info("Hot reload: rechargement allowlist + protected ranges")
-    cs_allowlist = get_crowdsec_allowlist()
-    _protected_networks = _build_protected_networks()
-    _sup._protected_networks = _protected_networks
-    log.info("Hot reload terminé — allowlist: %d entrées, protected: %d nets",
-             len(cs_allowlist), len(_protected_networks))
-    return cs_allowlist
-
-
-# ── Main ──────────────────────────────────────────────────────────────────────
-def main() -> None:
+def _startup_daemon() -> tuple:
     global _boot_healthy, _degraded_reason, _protected_networks
 
     _check_config()
@@ -2415,7 +2400,7 @@ def main() -> None:
     log.info("WAL: %d entrées existantes (prochain id: %d)", _wal_mod._wal_seq, _wal_mod._wal_seq + 1)
     _wal_trim()
 
-    # Probe CF connectivity at boot
+    # Probe CF connectivity at boot.
     # On failure: enter degraded mode — do NOT wipe CF rules with stale local state.
     # Cloudflare is the source of truth; we must be able to read it before modifying it.
     try:
@@ -2459,6 +2444,31 @@ def main() -> None:
     # READY=1 sent unconditionally — STATUS communicates boot health to systemd
     status_msg = "Degraded" if not _boot_healthy else "Running"
     _sd_notify(f"READY=1\nSTATUS={status_msg}\n")
+
+    return (cs_allowlist, reported, recidivists, modsec_state, cidr_state, waf_state, bouncer_check_state)
+
+
+def _handle_reload_if_needed(cs_allowlist: List[str]) -> List[str]:
+    global _protected_networks
+    if not _reload.is_set():
+        return cs_allowlist
+    _reload.clear()
+    log.info("Hot reload: rechargement allowlist + protected ranges")
+    cs_allowlist = get_crowdsec_allowlist()
+    _protected_networks = _build_protected_networks()
+    _sup._protected_networks = _protected_networks
+    log.info("Hot reload terminé — allowlist: %d entrées, protected: %d nets",
+             len(cs_allowlist), len(_protected_networks))
+    return cs_allowlist
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+def main() -> None:
+    (
+        cs_allowlist, reported, recidivists,
+        modsec_state, cidr_state, waf_state,
+        bouncer_check_state,
+    ) = _startup_daemon()
 
     loop_count      = 0
     waf_poll_count  = 0
