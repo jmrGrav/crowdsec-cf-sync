@@ -97,10 +97,32 @@ from crowdsec_cf_sync.config import (
 )
 
 # ── Module-level state ────────────────────────────────────────────────────────
-_shutdown  = threading.Event()
-_reload    = threading.Event()
-_boot_healthy: bool = False  # True after first successful CF API probe
-_degraded_reason: str = ""   # non-empty when in degraded mode
+
+class Supervisor:
+    """Container for runtime-mutable daemon state (replaces module-level globals).
+
+    Attributes are added incrementally per phase. Module-level aliases below
+    keep existing call-sites unchanged during the transition.
+    """
+    def __init__(self) -> None:
+        self._shutdown        = threading.Event()
+        self._reload          = threading.Event()
+        self._boot_healthy    = False  # True after first successful CF API probe
+        self._degraded_reason = ""    # non-empty when in degraded mode
+
+
+_sup = Supervisor()
+
+# Phase-9.1 aliases: threading.Event aliases share the same object so mutations
+# via either name are visible everywhere. bool/str aliases are initial copies;
+# once main() rebinds the module-level name via `global`, _sup.* diverges —
+# resolved when main() is updated in a later phase.
+_shutdown        = _sup._shutdown
+_reload          = _sup._reload
+_boot_healthy    = _sup._boot_healthy
+_degraded_reason = _sup._degraded_reason
+
+# Lua runtime state and health — migrated to Supervisor in later phases.
 _lua_sync_version: int = 0   # monotonic version pushed to Lua sync file
 _lua_last_known_version: int = 0   # last sync_version observed from Lua endpoint
 _lua_last_version_change_ts: float = 0.0  # monotonic time of last version change
