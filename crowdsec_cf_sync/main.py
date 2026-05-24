@@ -109,24 +109,36 @@ class Supervisor:
         self._reload          = threading.Event()
         self._boot_healthy    = False  # True after first successful CF API probe
         self._degraded_reason = ""    # non-empty when in degraded mode
+        # Lua auto-heal state
+        self._lua_sync_version: int = 0
+        self._lua_last_known_version: int = 0
+        self._lua_last_version_change_ts: float = 0.0
+        self._lua_last_heal_ts: float = 0.0
+        # Populated at startup, rebuilt on SIGHUP
+        self._protected_networks: List[ipaddress._BaseNetwork] = []
+        # Health endpoint state — shared with HTTP handler thread
+        self._health_state: dict = {}
+        self._health_lock = threading.Lock()
 
 
 _sup = Supervisor()
 
-# Phase-9.1 aliases: threading.Event aliases share the same object so mutations
-# via either name are visible everywhere. bool/str aliases are initial copies;
-# once main() rebinds the module-level name via `global`, _sup.* diverges —
-# resolved when main() is updated in a later phase.
-_shutdown        = _sup._shutdown
-_reload          = _sup._reload
-_boot_healthy    = _sup._boot_healthy
-_degraded_reason = _sup._degraded_reason
-
-# Lua runtime state and health — migrated to Supervisor in later phases.
-_lua_sync_version: int = 0   # monotonic version pushed to Lua sync file
-_lua_last_known_version: int = 0   # last sync_version observed from Lua endpoint
-_lua_last_version_change_ts: float = 0.0  # monotonic time of last version change
-_lua_last_heal_ts: float = 0.0            # monotonic time of last auto-heal reload
+# Module-level aliases — existing call-sites need no changes during the transition.
+# threading.Event, Lock, list, dict aliases share the same object (mutations
+# visible through both names). bool/str/int/float aliases are initial copies;
+# after global rebinds in push_lua_state, check_lua_autoheal, main() etc.,
+# _sup.* diverges — resolved when those functions are updated in a later phase.
+_shutdown                 = _sup._shutdown
+_reload                   = _sup._reload
+_boot_healthy             = _sup._boot_healthy
+_degraded_reason          = _sup._degraded_reason
+_lua_sync_version         = _sup._lua_sync_version
+_lua_last_known_version   = _sup._lua_last_known_version
+_lua_last_version_change_ts = _sup._lua_last_version_change_ts
+_lua_last_heal_ts         = _sup._lua_last_heal_ts
+_protected_networks       = _sup._protected_networks
+_health_state             = _sup._health_state
+_health_lock              = _sup._health_lock
 
 
 def _handle_signal(signum: int, frame) -> None:
@@ -312,9 +324,6 @@ _BOUNCER_STORE  = StateStore(lambda: BOUNCER_CHECK_STATE)
 
 
 # ── Protected ranges (anti-self-ban) ─────────────────────────────────────────
-_protected_networks: List[ipaddress._BaseNetwork] = []
-
-
 def _build_protected_networks() -> List[ipaddress._BaseNetwork]:
     nets: List[ipaddress._BaseNetwork] = []
     for cidr in _PROTECTED_CIDRS_STATIC:
@@ -523,10 +532,6 @@ def _build_prometheus(snap: Optional[dict] = None) -> str:
         "",
     ]
     return "\n".join(lines)
-
-
-_health_state: dict = {}
-_health_lock  = threading.Lock()
 
 
 def _start_health_server() -> Optional[http.server.HTTPServer]:
