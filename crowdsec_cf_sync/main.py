@@ -126,8 +126,7 @@ _sup = Supervisor()
 # Module-level aliases — existing call-sites need no changes during the transition.
 # threading.Event, Lock, list, dict aliases share the same object (mutations
 # visible through both names). bool/str/int/float aliases are initial copies;
-# after global rebinds in push_lua_state, check_lua_autoheal, main() etc.,
-# _sup.* diverges — resolved when those functions are updated in a later phase.
+# at each global rebind site _sup.* is kept in sync explicitly (Phase 9.4).
 _shutdown                 = _sup._shutdown
 _reload                   = _sup._reload
 _boot_healthy             = _sup._boot_healthy
@@ -1928,7 +1927,8 @@ def push_lua_state(
     try:
         LUA_SYNC_DIR.mkdir(parents=True, exist_ok=True)
 
-        _lua_sync_version += 1
+        _sup._lua_sync_version += 1
+        _lua_sync_version = _sup._lua_sync_version
 
         bans: Dict[str, LuaBanEntry] = {}
 
@@ -2116,12 +2116,15 @@ def check_lua_autoheal() -> None:
     now = time.monotonic()
 
     if version != _lua_last_known_version:
+        _sup._lua_last_known_version = version
         _lua_last_known_version = version
+        _sup._lua_last_version_change_ts = now
         _lua_last_version_change_ts = now
         return  # version is moving, all good
 
     # Version has not changed — check if it's been frozen too long
     if _lua_last_version_change_ts == 0.0:
+        _sup._lua_last_version_change_ts = now
         _lua_last_version_change_ts = now
         return
 
@@ -2147,8 +2150,10 @@ def check_lua_autoheal() -> None:
             capture_output=True, text=True, timeout=10,
         )
         if result.returncode == 0:
+            _sup._lua_last_heal_ts = now
             _lua_last_heal_ts = now
-            _lua_last_version_change_ts = now  # reset frozen clock
+            _sup._lua_last_version_change_ts = now  # reset frozen clock
+            _lua_last_version_change_ts = now
             slog("autoheal", "reload_ok", status="success")
             metrics.inc("lua_autoheal_reloads")
         else:
@@ -2377,6 +2382,7 @@ def main() -> None:
     signal.signal(signal.SIGHUP,  _handle_signal)
 
     _protected_networks = _build_protected_networks()
+    _sup._protected_networks = _protected_networks
     log.info("Protected ranges: %d réseaux chargés", len(_protected_networks))
 
     log.info(
@@ -2400,10 +2406,12 @@ def main() -> None:
     # Cloudflare is the source of truth; we must be able to read it before modifying it.
     try:
         _fetch_cf_rules()
+        _sup._boot_healthy = True
         _boot_healthy = True
         log.info("Boot: CF accessible — démarrage normal")
     except Exception as exc:
         _degraded_reason = f"CF inaccessible au démarrage: {exc}"
+        _sup._degraded_reason = _degraded_reason
         log.error("DEGRADED BOOT: %s", _degraded_reason)
         log.warning(
             "Daemon en mode dégradé — aucune modification CF "
@@ -2452,6 +2460,7 @@ def main() -> None:
             log.info("Hot reload: rechargement allowlist + protected ranges")
             cs_allowlist = get_crowdsec_allowlist()
             _protected_networks = _build_protected_networks()
+            _sup._protected_networks = _protected_networks
             log.info("Hot reload terminé — allowlist: %d entrées, protected: %d nets",
                      len(cs_allowlist), len(_protected_networks))
 
@@ -2459,7 +2468,9 @@ def main() -> None:
         if not _boot_healthy:
             try:
                 _fetch_cf_rules()
+                _sup._boot_healthy = True
                 _boot_healthy    = True
+                _sup._degraded_reason = ""
                 _degraded_reason = ""
                 log.info("CF rétabli — sortie du mode dégradé")
             except Exception:
