@@ -2371,6 +2371,24 @@ def cmd_doctor() -> int:
         return 2
 
 
+def _run_reconciliation_if_due(
+    cs_allowlist: List[str],
+    last_reconcile: float,
+    reconcile_count: int,
+) -> tuple:
+    if (
+        not _shutdown.is_set()
+        and (time.monotonic() - last_reconcile) >= RECONCILE_SECS
+    ):
+        corrected = reconcile_state(cs_allowlist)
+        if corrected:
+            log.info("Reconciliation: %d règle(s) corrigée(s)", corrected)
+        last_reconcile = time.monotonic()
+        reconcile_count += 1
+        _wal_trim()
+    return (last_reconcile, reconcile_count)
+
+
 def _run_waf_poll_if_due(
     waf_poll_count: int,
     waf_state: dict,
@@ -2590,16 +2608,9 @@ def main() -> None:
             )
 
             # Periodic reconciliation
-            if (
-                not _shutdown.is_set()
-                and (time.monotonic() - last_reconcile) >= RECONCILE_SECS
-            ):
-                corrected = reconcile_state(cs_allowlist)
-                if corrected:
-                    log.info("Reconciliation: %d règle(s) corrigée(s)", corrected)
-                last_reconcile = time.monotonic()
-                reconcile_count += 1
-                _wal_trim()
+            last_reconcile, reconcile_count = _run_reconciliation_if_due(
+                cs_allowlist, last_reconcile, reconcile_count
+            )
 
             # Refresh allowlist every 10 cycles
             loop_count += 1
