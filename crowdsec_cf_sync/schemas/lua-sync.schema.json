@@ -1,0 +1,100 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "lua-sync.schema.json",
+  "title": "LuaSyncPayload",
+  "description": "Python→Lua IPC file at LUA_SYNC_DIR/bans.json (default /run/crowdsec-lua/bans.json). Written atomically by push_lua_state() via mkstemp+fsync+os.replace. OpenResty polls this file every 5s and loads verdicts into a shared dict. Lua validates entry_count and payload_crc32 before accepting; on mismatch it keeps the previous good state.",
+  "type": "object",
+  "required": [
+    "version", "updated_at", "updated_at_epoch",
+    "entry_count", "writer_pid", "writer_hostname",
+    "bans", "cidrs", "meta", "payload_crc32"
+  ],
+  "properties": {
+    "version": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Monotonically increasing sync counter within the current daemon process. Resets to 1 on daemon restart. Lua uses this to detect frozen pushes (auto-heal trigger)."
+    },
+    "updated_at": {
+      "type": "string",
+      "description": "ISO 8601 datetime with UTC offset, written by datetime.now(timezone.utc).isoformat()."
+    },
+    "updated_at_epoch": {
+      "type": "integer",
+      "description": "Unix timestamp (seconds) at push time. Convenience field for Lua/shell consumers that cannot parse ISO dates."
+    },
+    "entry_count": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "len(bans) + len(cidrs). Lua verifies this matches the actual counts before accepting the payload."
+    },
+    "writer_pid": {
+      "type": "integer",
+      "description": "PID of the Python daemon process that wrote this file."
+    },
+    "writer_hostname": {
+      "type": "string",
+      "description": "socket.gethostname() of the writer."
+    },
+    "bans": {
+      "type": "object",
+      "description": "Per-IP ban verdicts. Keys are IPv4 or IPv6 address strings.",
+      "additionalProperties": { "$ref": "#/$defs/LuaBanEntry" }
+    },
+    "cidrs": {
+      "type": "object",
+      "description": "Per-CIDR ban verdicts. Keys are CIDR strings (e.g. '1.2.3.0/24').",
+      "additionalProperties": { "$ref": "#/$defs/LuaBanEntry" }
+    },
+    "meta": {
+      "type": "object",
+      "description": "Python daemon operational counters. Lua exposes these at /crowdsec-status and /crowdsec-metrics without a separate port-8765 call.",
+      "required": ["cycle_count", "cf_api_errors", "wal_entries", "lua_sync_errors", "degraded"],
+      "properties": {
+        "cycle_count":     { "type": "integer", "minimum": 0 },
+        "cf_api_errors":   { "type": "integer", "minimum": 0 },
+        "wal_entries":     { "type": "integer", "minimum": 0 },
+        "lua_sync_errors": { "type": "integer", "minimum": 0 },
+        "degraded":        { "type": "boolean", "description": "True when daemon is in degraded mode (CF unreachable at boot or degraded_reason set)." }
+      },
+      "additionalProperties": true
+    },
+    "payload_crc32": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 4294967295,
+      "description": "CRC-32 (unsigned, masked with 0xFFFFFFFF) of the canonical JSON of the payload before this field was added (json.dumps(payload, sort_keys=True, ensure_ascii=False)). Used by Lua as a lightweight integrity check."
+    }
+  },
+  "additionalProperties": true,
+  "$defs": {
+    "LuaBanEntry": {
+      "type": "object",
+      "required": ["score", "level", "ttl", "reason"],
+      "properties": {
+        "score": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100,
+          "description": "Threat score. CrowdSec bans: 70 base + 10 per recidivist count (capped at 100). ModSec: 80. CIDR: 100."
+        },
+        "level": {
+          "type": "integer",
+          "const": 5,
+          "description": "Always 5 in current implementation."
+        },
+        "ttl": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "TTL in seconds. CrowdSec bans: 3600. ModSec bans: MODSEC_BAN_SECS (default 7200). CIDR: 86400."
+        },
+        "reason": {
+          "type": "string",
+          "enum": ["crowdsec-ban", "modsec-ban", "crowdsec-cidr"],
+          "description": "Ban origin tag."
+        }
+      },
+      "additionalProperties": true
+    }
+  }
+}

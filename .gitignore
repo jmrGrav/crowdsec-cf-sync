@@ -12,4 +12,5 @@ build/
 *.json
 !tests/fixtures/**/*.json
 !tests/golden/**/*.json
+!crowdsec_cf_sync/schemas/*.json
 .DS_Store

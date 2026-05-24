@@ -31,6 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _supervisor import load_supervisor
 
 sup = load_supervisor()
+import crowdsec_cf_sync.wal as _wal_mod
 
 
 class _WalBase(unittest.TestCase):
@@ -39,14 +40,14 @@ class _WalBase(unittest.TestCase):
     def setUp(self):
         self.tmpdir = Path(tempfile.mkdtemp(prefix="brooks-wal-"))
         self.wal_path = self.tmpdir / "wal.jsonl"
-        self._original_wal = sup.WAL_FILE
-        self._original_seq = sup._wal_seq
-        sup.WAL_FILE = self.wal_path
-        sup._wal_seq = 0
+        self._original_wal = _wal_mod.WAL_FILE
+        self._original_seq = _wal_mod._wal_seq
+        _wal_mod.WAL_FILE = self.wal_path
+        _wal_mod._wal_seq = 0
 
     def tearDown(self):
-        sup.WAL_FILE = self._original_wal
-        sup._wal_seq = self._original_seq
+        _wal_mod.WAL_FILE = self._original_wal
+        _wal_mod._wal_seq = self._original_seq
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     def _read_entries(self):
@@ -134,8 +135,8 @@ class WalIdMonotonicityTests(_WalBase):
         self.assertEqual(first_session_ids, [1, 2, 3])
 
         # Simulate restart: _wal_seq reset, _init_wal_seq() re-reads file
-        sup._wal_seq = sup._init_wal_seq()
-        self.assertEqual(sup._wal_seq, 3, "init_wal_seq MUST recover exact prior count")
+        _wal_mod._wal_seq = sup._init_wal_seq()
+        self.assertEqual(_wal_mod._wal_seq, 3, "init_wal_seq MUST recover exact prior count")
 
         # Second instance appends two more entries
         for i in range(3, 5):

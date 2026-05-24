@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "health.schema.json",
+  "title": "HealthResponse",
+  "description": "JSON response from GET http://localhost:HEALTH_PORT/health (default :8765). Built by _build_health() and served by the embedded HTTP server. HTTP 200 when status is 'healthy' or 'dry_run'; HTTP 503 when 'degraded'.",
+  "type": "object",
+  "required": [
+    "status", "mode",
+    "cloudflare_cb", "crowdsec_cb", "abuseipdb_cb",
+    "last_sync", "uptime_start",
+    "cycle_count",
+    "cf_rules_added", "cf_rules_removed", "cf_api_errors",
+    "cf_quota_warnings", "drift_detected",
+    "allowlist_size", "recidivists", "cidr_blocks",
+    "dry_run", "cf_min_confidence", "state_version"
+  ],
+  "properties": {
+    "status": {
+      "type": "string",
+      "enum": ["healthy", "degraded", "dry_run"],
+      "description": "Overall daemon health. 'degraded' when CF was unreachable at boot, a circuit breaker is open, or degraded_reason is set. 'dry_run' when CF_DRY_RUN=1."
+    },
+    "mode": {
+      "type": "string",
+      "enum": ["healthy", "degraded", "dry_run"],
+      "description": "Alias of 'status' (same value). Both fields present for consumer convenience."
+    },
+    "cloudflare_cb": {
+      "type": "string",
+      "enum": ["open", "closed"],
+      "description": "Cloudflare API circuit breaker state."
+    },
+    "crowdsec_cb": {
+      "type": "string",
+      "enum": ["open", "closed"],
+      "description": "CrowdSec LAPI circuit breaker state."
+    },
+    "abuseipdb_cb": {
+      "type": "string",
+      "enum": ["open", "closed"],
+      "description": "AbuseIPDB API circuit breaker state."
+    },
+    "last_sync": {
+      "type": "string",
+      "description": "ISO 8601 datetime of last successful sync cycle, or empty string before first cycle."
+    },
+    "uptime_start": {
+      "type": "string",
+      "description": "ISO 8601 datetime when the daemon started, or empty string if not yet set."
+    },
+    "cycle_count":       { "type": "integer", "minimum": 0 },
+    "cf_rules_added":    { "type": "integer", "minimum": 0 },
+    "cf_rules_removed":  { "type": "integer", "minimum": 0 },
+    "cf_api_errors":     { "type": "integer", "minimum": 0 },
+    "cf_quota_warnings": { "type": "integer", "minimum": 0 },
+    "drift_detected":    { "type": "integer", "minimum": 0, "description": "Count of reconciliation corrections." },
+    "allowlist_size":    { "type": "integer", "minimum": 0, "description": "Current CrowdSec allowlist entry count." },
+    "recidivists":       { "type": "integer", "minimum": 0, "description": "Known recidivist IP count (excludes '_cursor' key)." },
+    "cidr_blocks":       { "type": "integer", "minimum": 0 },
+    "dry_run":           { "type": "boolean" },
+    "cf_min_confidence": {
+      "type": "string",
+      "enum": ["low", "medium", "high"],
+      "description": "CF_MIN_CONFIDENCE env var value."
+    },
+    "state_version":     { "type": "integer", "const": 1, "description": "STATE_VERSION constant." },
+    "degraded_reason": {
+      "type": "string",
+      "description": "Human-readable degraded reason. Present only when non-empty (i.e. when status='degraded' due to CF boot failure)."
+    }
+  },
+  "additionalProperties": true
+}

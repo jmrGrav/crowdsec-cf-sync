@@ -110,10 +110,11 @@ des comportements actuels = bombe à retardement.
 `schemas/*.schema.json`) avant tout changement de format. Le test d'intégration valide
 ensuite la conformité.
 
-**Avant de toucher :**
-- Documenter le format actuel exact dans `docs/ipc-schema.md`
-- Si JSON Schema : ajouter validation dans `scripts/test-lua-integration.sh`
-- Tagger une version de schéma (séparée de `STATE_VERSION` Python)
+**Réalisé :**
+- Formats documentés dans `crowdsec_cf_sync/schemas/` (5 fichiers JSON Schema Draft 2020-12)
+- Index des boundaries IPC dans `crowdsec_cf_sync/schemas/README.md`
+- Formats dérivés des producteurs réels (code + TypedDicts + fixtures) — aucune validation runtime ajoutée
+- Invariants implicites capturés : `additionalProperties: true` partout (tolerance existante préservée)
 
 ---
 
@@ -200,10 +201,10 @@ Ordre **non négociable** :
 5b. ✅ Prod-pattern fixtures + corruption variants (+18 tests) (DONE 2026-05-24)
 6. ✅ F3 — StateStore (extraction load_X/save_X) in-file class (DONE 2026-05-24, branch refactor/state-store-extraction)
 7. ✅ F7 — Models (dataclass/TypedDict, sérialisation préservée) (DONE 2026-05-24, commit 3f152c0)
-8. ⏳ F1 phases 1-4 — Safe Extraction (move StateStore to state_store.py + wal.py + models.py + config.py — true package layout)  ← NEXT
-9. ⏳ F1 phase 5 + F2 + F6 — Supervisor class
-10. ⏳ F1 phase 6 + F5 — Pipeline explicite
-11. ⏳ F4 — IPC Contract formalisé (JSON Schema files)
+8. ✅ F1 phases 1-4 — Safe Extraction (state_store.py + wal.py + models.py + config.py — true package layout) (DONE 2026-05-25, branch refactor/package-extraction)
+9. ✅ F1 phase 5 + F2 + F6 — Supervisor class (phases 9.1–9.4: globals→attrs, CB, lua/health/protected, _sup.* sync) (DONE 2026-05-25)
+10. ✅ F1 phase 6 + F5 — Pipeline explicite (8 extractions: _startup_daemon, _handle_reload_if_needed, _try_recover_degraded, _ingest_lua_events, _sync_crowdsec_sources, _sync_lua_state, _run_waf_poll_if_due, _run_reconciliation_if_due, _update_health_state) (DONE 2026-05-25)
+11. ✅ F4 — IPC Contract formalisé (5 JSON Schemas) (DONE 2026-05-25, `crowdsec_cf_sync/schemas/`)
 ```
 
 **Tests :** `scripts/test-python.sh` (stdlib unittest, hermétiques, ~0.5s pour 104 tests).

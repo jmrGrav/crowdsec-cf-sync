@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "wal-entry.schema.json",
+  "title": "WalEntry",
+  "description": "One line in cf-sync-wal.jsonl. Written by _wal_log(), read by cmd_wal_inspect() and cmd_wal_replay(). Crash-durable: each entry is fsynced before _wal_log() returns. Malformed lines are skipped by all readers (tolerance by design).",
+  "type": "object",
+  "required": ["id", "op", "target", "tag", "ts", "attempt", "dry_run"],
+  "properties": {
+    "id": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Monotonically increasing within a daemon instance. Restored from line count on restart (_init_wal_seq). Not globally unique across restarts — ids continue from prior count, so gaps are possible after _wal_trim()."
+    },
+    "op": {
+      "type": "string",
+      "enum": ["add", "remove", "reconcile"],
+      "description": "Intended CF operation. Note: cmd_wal_inspect and cmd_wal_replay currently read 'action' instead of 'op' — they always see '?' / '' (known bug, documented)."
+    },
+    "target": {
+      "type": "string",
+      "description": "IP address, CIDR block, or 'full' for reconcile ops."
+    },
+    "tag": {
+      "type": "string",
+      "default": "",
+      "description": "CF rule note tag (e.g. 'crowdsec-local-ban', 'modsec-ban'). Empty string when not applicable."
+    },
+    "ts": {
+      "type": "string",
+      "description": "ISO 8601 datetime with UTC offset, written by datetime.now(timezone.utc).isoformat()."
+    },
+    "attempt": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 1,
+      "description": "Retry count for this operation."
+    },
+    "dry_run": {
+      "type": "boolean",
+      "default": false,
+      "description": "True when CF_DRY_RUN=1; the operation was not actually applied."
+    }
+  },
+  "additionalProperties": true
+}

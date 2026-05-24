@@ -26,20 +26,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _supervisor import load_supervisor
 
 sup = load_supervisor()
+import crowdsec_cf_sync.wal as _wal_mod
 
 
 class _WalBase(unittest.TestCase):
     def setUp(self):
         self.tmpdir = Path(tempfile.mkdtemp(prefix="brooks-wal-corrupt-"))
         self.wal_path = self.tmpdir / "wal.jsonl"
-        self._original_wal = sup.WAL_FILE
-        self._original_seq = sup._wal_seq
-        sup.WAL_FILE = self.wal_path
-        sup._wal_seq = 0
+        self._original_wal = _wal_mod.WAL_FILE
+        self._original_seq = _wal_mod._wal_seq
+        _wal_mod.WAL_FILE = self.wal_path
+        _wal_mod._wal_seq = 0
 
     def tearDown(self):
-        sup.WAL_FILE = self._original_wal
-        sup._wal_seq = self._original_seq
+        _wal_mod.WAL_FILE = self._original_wal
+        _wal_mod._wal_seq = self._original_seq
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     def _read_lines(self):
@@ -71,7 +72,7 @@ class MalformedLineTests(_WalBase):
     def test_invariant_append_after_malformed_works(self):
         """A malformed line MUST NOT block subsequent appends."""
         self.wal_path.write_text("garbage line\n")
-        sup._wal_seq = sup._init_wal_seq()
+        _wal_mod._wal_seq = sup._init_wal_seq()
         sup._wal_log("add", "1.2.3.4")
         # 2 lines total
         self.assertEqual(len(self._read_lines()), 2)

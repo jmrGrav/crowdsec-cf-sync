@@ -1,0 +1,110 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "state-envelope.schema.json",
+  "title": "StateEnvelope",
+  "description": "V4 envelope wrapping all six domain state files (recidivists.json, abuseipdb-reported.json, modsec-banned.json, cidr-banned.json, cf_waf_state.json, bouncer-abusecheck.json). Written by _atomic_write_json() via mkstemp+fsync+os.replace. See docs/state-format.md for the normative spec. STATE_VERSION=1.",
+  "type": "object",
+  "required": ["version", "updated_at", "sha256", "state"],
+  "properties": {
+    "version": {
+      "type": "integer",
+      "const": 1,
+      "description": "Format version. Currently always 1 (STATE_VERSION). Bumped only when the envelope structure itself changes. Domain-level format changes use a separate versioning scheme."
+    },
+    "updated_at": {
+      "type": "string",
+      "description": "ISO 8601 datetime with UTC offset, written by datetime.now(timezone.utc).isoformat() at save time."
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "SHA-256 hex digest of the canonical JSON of 'state' (json.dumps(state, sort_keys=True, ensure_ascii=False)). Verified on load; mismatch triggers reset + .bak rename."
+    },
+    "state": {
+      "type": "object",
+      "description": "Domain-specific state dict. Contents are opaque at envelope level — see per-domain schemas below.",
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true,
+  "$comment": "Backward compat: V3 flat files (plain JSON object with no 'version' key) are accepted by _load_json_state() and migrated to V4 envelope on next save. The V3 format is therefore read-only; all writes produce V4.",
+  "$defs": {
+    "RecidivistState": {
+      "description": "Contents of recidivists.json state dict. Keys are IP strings or '_cursor' (ISO datetime bookmark).",
+      "type": "object",
+      "additionalProperties": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": ["count", "last_seen"],
+            "properties": {
+              "count":     { "type": "integer", "minimum": 1 },
+              "last_seen": { "type": "string", "description": "ISO 8601 datetime" }
+            },
+            "additionalProperties": true
+          },
+          {
+            "type": "string",
+            "description": "_cursor bookmark value"
+          }
+        ]
+      }
+    },
+    "AbuseReportedState": {
+      "description": "Contents of abuseipdb-reported.json state dict. Keys are IP strings, values are ISO datetime strings (last report time).",
+      "type": "object",
+      "additionalProperties": { "type": "string" }
+    },
+    "ModsecState": {
+      "description": "Contents of modsec-banned.json state dict. Keys are IP strings.",
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["banned_at", "score", "uri"],
+        "properties": {
+          "banned_at": { "type": "string", "description": "ISO 8601 datetime" },
+          "score":     { "type": "integer", "minimum": 0 },
+          "uri":       { "type": "string" }
+        },
+        "additionalProperties": true
+      }
+    },
+    "CidrState": {
+      "description": "Contents of cidr-banned.json state dict. Keys are CIDR strings (e.g. '1.2.3.0/24').",
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["banned_at", "ip_count"],
+        "properties": {
+          "banned_at": { "type": "string", "description": "ISO 8601 datetime" },
+          "ip_count":  { "type": "integer", "minimum": 1 }
+        },
+        "additionalProperties": true
+      }
+    },
+    "CfWafState": {
+      "description": "Contents of cf_waf_state.json state dict. Sparse — may contain only 'last_event_dt' after init.",
+      "type": "object",
+      "properties": {
+        "last_event_dt": {
+          "type": "string",
+          "description": "ISO 8601 datetime of last WAF event processed."
+        }
+      },
+      "additionalProperties": true
+    },
+    "BouncerCheckState": {
+      "description": "Contents of bouncer-abusecheck.json state dict. Keys are IP strings.",
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["checked_at", "score"],
+        "properties": {
+          "checked_at": { "type": "string", "description": "ISO 8601 datetime" },
+          "score":      { "type": "integer", "minimum": 0, "maximum": 100 }
+        },
+        "additionalProperties": true
+      }
+    }
+  }
+}
