@@ -10,4 +10,6 @@ build/
 *.env
 *.log
 *.json
+!tests/fixtures/**/*.json
+!tests/golden/**/*.json
 .DS_Store
