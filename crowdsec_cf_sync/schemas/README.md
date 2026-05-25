@@ -26,12 +26,6 @@ OpenResty (Lua)  ──events.jsonl──▶  Python daemon  ──bans.json─�
                                     GET /health         (HTTP status endpoint)
 ```
 
-## Known issues
-
-- `cmd_wal_inspect` and `cmd_wal_replay` read `e["action"]` / `e["ip"]` but
-  entries are written with `e["op"]` / `e["target"]`. Both commands silently
-  return empty results on any real WAL. Fix tracked separately.
-
 ## Versioning
 
 - **WAL**: no format version field; stable since initial implementation.

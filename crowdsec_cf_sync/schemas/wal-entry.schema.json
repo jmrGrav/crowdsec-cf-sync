@@ -14,7 +14,7 @@
     "op": {
       "type": "string",
       "enum": ["add", "remove", "reconcile"],
-      "description": "Intended CF operation. Note: cmd_wal_inspect and cmd_wal_replay currently read 'action' instead of 'op' — they always see '?' / '' (known bug, documented)."
+      "description": "Intended CF operation."
     },
     "target": {
       "type": "string",
