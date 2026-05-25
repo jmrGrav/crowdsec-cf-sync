@@ -102,18 +102,18 @@ def cmd_wal_inspect() -> None:
     if not entries:
         return
 
-    by_action: Dict[str, int] = {}
-    ips: set = set()
+    by_op: Dict[str, int] = {}
+    targets: set = set()
     for e in entries:
-        action = e.get("action", "?")
-        by_action[action] = by_action.get(action, 0) + 1
-        if "ip" in e:
-            ips.add(e["ip"])
+        op = e.get("op", "?")
+        by_op[op] = by_op.get(op, 0) + 1
+        if "target" in e:
+            targets.add(e["target"])
 
-    print(f"  Unique IPs: {len(ips)}")
-    print(f"  Actions:")
-    for action, count in sorted(by_action.items(), key=lambda x: -x[1]):
-        print(f"    {action}: {count}")
+    print(f"  Unique targets: {len(targets)}")
+    print(f"  Operations:")
+    for op, count in sorted(by_op.items(), key=lambda x: -x[1]):
+        print(f"    {op}: {count}")
 
     first_ts = entries[0].get("ts", "?")
     last_ts  = entries[-1].get("ts", "?")
@@ -143,16 +143,16 @@ def cmd_wal_replay(dry_run: bool = True) -> None:
                 e = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            action = e.get("action", "")
-            ip = e.get("ip", "")
-            if not ip:
+            op     = e.get("op", "")
+            target = e.get("target", "")
+            if not target or op == "reconcile":
                 continue
-            if action in ("add", "ban"):
-                adds.append(ip)
-            elif action in ("remove", "unban"):
-                removes.append(ip)
+            if op == "add":
+                adds.append(target)
+            elif op == "remove":
+                removes.append(target)
 
-    # Net state: last action per IP wins
+    # Net state: last op per target wins
     net: Dict[str, str] = {}
     with WAL_FILE.open(encoding="utf-8", errors="ignore") as f:
         for line in f:
@@ -161,21 +161,22 @@ def cmd_wal_replay(dry_run: bool = True) -> None:
                 continue
             try:
                 e = json.loads(line)
-                ip = e.get("ip", "")
-                if ip:
-                    net[ip] = e.get("action", "?")
+                target = e.get("target", "")
+                op     = e.get("op", "")
+                if target and op != "reconcile":
+                    net[target] = op
             except json.JSONDecodeError:
                 continue
 
-    to_add    = [ip for ip, act in net.items() if act in ("add", "ban")]
-    to_remove = [ip for ip, act in net.items() if act in ("remove", "unban")]
+    to_add    = [t for t, op in net.items() if op == "add"]
+    to_remove = [t for t, op in net.items() if op == "remove"]
 
     print(f"WAL replay {'(DRY RUN)' if dry_run else '(EXECUTE)'}:")
     print(f"  Net state: {len(to_add)} to add, {len(to_remove)} to remove")
-    for ip in to_add[:20]:
-        print(f"  + {ip}")
-    for ip in to_remove[:20]:
-        print(f"  - {ip}")
+    for t in to_add[:20]:
+        print(f"  + {t}")
+    for t in to_remove[:20]:
+        print(f"  - {t}")
     if not dry_run:
         print("  Execute not yet implemented — use the main daemon loop instead.")
 
@@ -198,12 +199,12 @@ def cmd_wal_compact() -> None:
                 pass
 
     before = len(entries)
-    # Keep only the last entry per IP
+    # Keep only the last entry per target
     net: Dict[str, dict] = {}
     for e in entries:
-        ip = e.get("ip", "")
-        if ip:
-            net[ip] = e
+        target = e.get("target", "")
+        if target:
+            net[target] = e
 
     compacted = list(net.values())
     after = len(compacted)

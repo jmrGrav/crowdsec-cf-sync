@@ -199,6 +199,33 @@ class WalReplayDeterminismTests(_WalBase):
         second = self._capture_replay()
         self.assertEqual(first, second, "Replay output MUST be deterministic")
 
+    def test_invariant_replay_shows_correct_counts(self):
+        """Entries written by _wal_log('add') MUST appear in replay output count."""
+        sup._wal_log("add", "1.1.1.1")
+        sup._wal_log("add", "2.2.2.2")
+        sup._wal_log("remove", "3.3.3.3")
+        output = self._capture_replay()
+        self.assertIn("2 to add", output, "Two add entries must appear in replay")
+        self.assertIn("1 to remove", output, "One remove entry must appear in replay")
+        self.assertIn("+ 1.1.1.1", output, "Added IP must appear with + prefix")
+        self.assertIn("- 3.3.3.3", output, "Removed IP must appear with - prefix")
+
+    def test_invariant_replay_net_state_last_op_wins(self):
+        """When same target has both add and remove, the last op wins."""
+        sup._wal_log("add",    "9.9.9.9")
+        sup._wal_log("remove", "9.9.9.9")  # remove cancels add
+        output = self._capture_replay()
+        self.assertIn("0 to add", output)
+        self.assertIn("1 to remove", output)
+
+    def test_invariant_replay_skips_reconcile_entries(self):
+        """'reconcile' op entries MUST NOT appear in to_add or to_remove."""
+        sup._wal_log("add",       "1.1.1.1")
+        sup._wal_log("reconcile", "full")
+        output = self._capture_replay()
+        self.assertIn("1 to add", output)
+        self.assertIn("0 to remove", output)
+
     def test_invariant_replay_does_not_mutate_wal(self):
         """Replay is read-only: WAL contents and size MUST be unchanged."""
         for i in range(3):
@@ -240,6 +267,8 @@ class WalInspectTests(_WalBase):
             sup._wal_log("add", f"10.0.0.{i}")
         output = self._capture_inspect()
         self.assertIn("Total entries: 5", output)
+        self.assertIn("Unique targets: 5", output, "Inspect MUST report unique targets")
+        self.assertIn("add: 5", output, "Inspect MUST group by op field")
 
     def test_invariant_inspect_robust_to_malformed_lines(self):
         sup._wal_log("add", "1.1.1.1")
