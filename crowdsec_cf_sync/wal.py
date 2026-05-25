@@ -18,6 +18,10 @@ from crowdsec_cf_sync.models import WalEntry
 log = logging.getLogger("cf_sync")
 
 WAL_FILE: Path = Path("/var/log/crowdsec/cf-sync-wal.jsonl")
+
+# Optional callback set by main.py after import: lambda: metrics.inc("wal_entries")
+# Using a callback avoids a circular import (wal → main → wal).
+_on_wal_write = None
 _wal_seq: int = 0
 
 
@@ -51,10 +55,8 @@ def _wal_log(op: str, target: str, tag: str = "", dry_run: bool = False,
             f.write(json.dumps(entry) + "\n")
             f.flush()
             os.fsync(f.fileno())   # crash-durable WAL entry
-        try:
-            metrics.inc("wal_entries")  # noqa: F821
-        except Exception:
-            pass
+        if _on_wal_write is not None:
+            _on_wal_write()
     except Exception as exc:
         log.debug("WAL write failed: %s", exc)
 

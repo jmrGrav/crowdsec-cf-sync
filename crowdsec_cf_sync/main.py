@@ -70,6 +70,7 @@ from crowdsec_cf_sync.state_store import (
     _load_json_state, _atomic_write_json,
 )
 import crowdsec_cf_sync.wal as _wal_mod
+_wal_mod._on_wal_write = lambda: metrics.inc("wal_entries")
 from crowdsec_cf_sync.wal import (
     WAL_FILE,
     _init_wal_seq, _wal_log, _wal_trim,
